@@ -1,0 +1,6 @@
+data/
+CLAUDE.md
+test.md
+*.sh
+.vscode/
+knn_out/
