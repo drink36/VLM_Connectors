@@ -111,6 +111,92 @@ def plot_single_dataset_topk_full(
     _save_fig(fig, save_path)
 
 
+def plot_single_dataset_topk_with_ref(
+    model_json_map,
+    ref="dino",
+    title="mtf2025/0000",
+    save_path="single_dataset_topk_with_ref.png",
+    ylim=(0.0, 0.4),
+    annotate=False,
+):
+    """
+    Single panel with three line styles per model:
+      solid  = KNOR(ref→pre)
+      dashed = KNOR(ref→post)
+      dotted = KNOR(pre→post)
+    Color encodes model identity.
+    """
+    linestyle_map = {
+        "ref_pre":  ("-",  f"{ref}→pre"),
+        "ref_post": ("--", f"{ref}→post"),
+    }
+
+    fig, ax = plt.subplots(figsize=(9.0, 5.8))
+    yrange = ylim[1] - ylim[0]
+    offset = 0.015 * yrange
+
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    model_colors = {m: color_cycle[i % len(color_cycle)] for i, m in enumerate(model_json_map)}
+
+    legend_model_handles = []
+    legend_type_handles = []
+
+    for model_name, json_path in model_json_map.items():
+        data = load_json(json_path)
+        color = model_colors[model_name]
+        marker = marker_map.get(model_name, "o")
+
+        series = {
+            "ref_pre":  [data.get(f"{ref}_pre_top{k}", {}).get("mean", float("nan")) for k in k_values],
+            "ref_post": [data.get(f"{ref}_post_top{k}", {}).get("mean", float("nan")) for k in k_values],
+        }
+
+        for key, (ls, _) in linestyle_map.items():
+            line, = ax.plot(
+                k_values, series[key],
+                color=color, linestyle=ls, marker=marker,
+                linewidth=2.2, markersize=8,
+            )
+            if annotate:
+                for x, yy in zip(k_values, series[key]):
+                    if not (yy != yy):  # not nan
+                        ax.text(x, yy + offset, f"{yy:.3f}", ha="center", va="bottom", fontsize=11)
+
+        # one colored patch per model for the model legend
+        legend_model_handles.append(
+            plt.Line2D([0], [0], color=color, marker=marker, linewidth=2.2, markersize=8, label=model_name)
+        )
+
+    # linestyle legend entries (use black)
+    for key, (ls, label) in linestyle_map.items():
+        legend_type_handles.append(
+            plt.Line2D([0], [0], color="black", linestyle=ls, linewidth=2.2, label=label)
+        )
+
+    ax.set_title(title, fontsize=22, pad=14)
+    ax.set_xlabel(r"$k$", fontsize=20)
+    ax.set_ylabel("Overlap Ratio", fontsize=20)
+    ax.set_xticks(k_values)
+    ax.set_ylim(*ylim)
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(axis="both", labelsize=16, width=1.0, length=6)
+
+    leg1 = fig.legend(
+        legend_model_handles, [h.get_label() for h in legend_model_handles],
+        loc="upper center", ncol=len(legend_model_handles),
+        frameon=False, fontsize=15, bbox_to_anchor=(0.5, 1.04), handlelength=2.0,
+    )
+    fig.add_artist(leg1)
+    fig.legend(
+        legend_type_handles, [h.get_label() for h in legend_type_handles],
+        loc="upper center", ncol=len(legend_type_handles),
+        frameon=False, fontsize=15, bbox_to_anchor=(0.5, 0.97), handlelength=2.4,
+    )
+
+    fig.subplots_adjust(top=0.78)
+    _save_fig(fig, save_path)
+
+
 def plot_multi_dataset_topk_full(
     json_map,
     save_path="compare_models_full.png",
@@ -494,66 +580,45 @@ def plot_triway_knor_lines(
 
 if __name__ == "__main__":
     # Example usage:
+    base = "data/output/knn_out_clip"
+    save_base = "figures/knn_clip"
     model_json_map = {
-        "LLaVA": "knn_out_llava/overlap_top100_l2_torch.json",
-        "Idefics2": "knn_out_idefics2/overlap_top100_l2_torch.json",
-        "Qwen-2.5-VL": "knn_out_qwen2.5vl/overlap_top100_l2_torch.json",
-        "Qwen-3.5": "knn_out_qwen3.5/overlap_top100_l2_torch.json",
+        "LLaVA": f"{base}/llava_00000/overlap_top100_l2_torch.json",
+        "Idefics2": f"{base}/idefics2_00000/overlap_top100_l2_torch.json",
+        "Qwen-2.5-VL": f"{base}/qwen2.5vl_00000/overlap_top100_l2_torch.json",
+        "Qwen-3.5": f"{base}/qwen3.5_00000/overlap_top100_l2_torch.json",
     }
     plot_single_dataset_topk_full(
         model_json_map,
         title="mtf2025/0000",
-        save_path="single_dataset_topk_mtf2025_0000.png",
+        save_path=f"{save_base}/single_dataset_topk_mtf2025_0000.png",
     )
-    plot_pre_post_singular_spectrum(
-    "knn_out_llava/overlap_top100_l2_torch.json",
-    save_path="figures/singular_spectrum_llava.png",
-    topn=100,
-    log_scale=True,
+    plot_single_dataset_topk_with_ref(
+        model_json_map,
+        ref="clip",
+        title="mtf2025/0000 — KNOR with CLIP reference",
+        save_path=f"{save_base}/single_dataset_topk_with_clip.png",
     )
-    plot_pre_post_energy_spectrum(
-        "knn_out_llava/overlap_top100_l2_torch.json",
-        save_path="figures/energy_spectrum_llava.png",
-        topn=100,
-        log_scale=True,
-    )
-    plot_pre_post_summary_bars(
-        "knn_out_llava/overlap_top100_l2_torch.json",
-        save_path="figures/pre_post_summary_bars_llava.png",
-    )
-    plot_pre_post_singular_spectrum(
-    "knn_out_idefics2/overlap_top100_l2_torch.json",
-    save_path="figures/singular_spectrum_idefics2.png",
-    topn=100,
-    log_scale=True,
-    )
-    plot_pre_post_energy_spectrum(
-        "knn_out_idefics2/overlap_top100_l2_torch.json",
-        save_path="figures/energy_spectrum_idefics2.png",
-        topn=100,
-        log_scale=True,
-    )
-    plot_pre_post_summary_bars(
-        "knn_out_idefics2/overlap_top100_l2_torch.json",
-        save_path="figures/pre_post_summary_bars_idefics2.png",
-    )
-    plot_pre_post_singular_spectrum(
-    "knn_out_qwen2.5vl/overlap_top100_l2_torch.json",
-    save_path="figures/singular_spectrum_qwen2.5vl.png",
-    topn=100,
-    log_scale=True,
-    )
-    plot_pre_post_energy_spectrum(
-        "knn_out_qwen2.5vl/overlap_top100_l2_torch.json",
-        save_path="figures/energy_spectrum_qwen2.5vl.png",
-        topn=100,
-        log_scale=True,
-    )
-    plot_pre_post_summary_bars(
-        "knn_out_qwen2.5vl/overlap_top100_l2_torch.json",
-        save_path="figures/pre_post_summary_bars_qwen2.5vl.png",
-    )
-
+    for model_name, json_path in model_json_map.items():
+        plot_pre_post_singular_spectrum(
+            json_path,
+            save_path=f"{save_base}/singular_spectrum_{model_name.lower().replace('-', '').replace('.', '')}.png",
+            topn=100,
+            log_scale=True,
+            title=f"{model_name} Singular Value Spectrum",
+        )
+        plot_pre_post_energy_spectrum(
+            json_path,
+            save_path=f"{save_base}/energy_spectrum_{model_name.lower().replace('-', '').replace('.', '')}.png",
+            topn=100,
+            log_scale=True,
+            title=f"{model_name} Energy Spectrum",
+        )
+        plot_pre_post_summary_bars(
+            json_path,
+            save_path=f"{save_base}/pre_post_summary_bars_{model_name.lower().replace('-', '').replace('.', '')}.png",
+            title=f"{model_name} Pre/Post Summary",
+        )
     # -----------------------------------------------------------------------
     # N-way KNOR: run knn.py with --ref_pt (CLIP) and --ref_pt2 (DINOv2) to
     # populate {label}_pre/post entries in each JSON, then call these.
@@ -587,12 +652,12 @@ if __name__ == "__main__":
         model_json_map,
         k=100,
         refs=("clip", "dino"),
-        title="KNOR (k=100): CLIP & DINOv2 ref vs pre/post-connector",
-        save_path="figures/triway_knor_bars_k100.png",
+        title="KNOR (k=100): CLIP & DINOv3 ref vs pre/post-connector",
+        save_path=f"{save_base}/triway_knor_bars_k100.png",
     )
     plot_triway_knor_lines(
         model_json_map,
         refs=("clip", "dino"),
-        title="KNOR across k: CLIP & DINOv2 ref",
-        save_path="figures/triway_knor_lines.png",
+        title="KNOR across k: CLIP & DINOv3 ref",
+        save_path=f"{save_base}/triway_knor_lines.png",
     )

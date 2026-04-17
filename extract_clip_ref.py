@@ -45,7 +45,7 @@ def parse_args():
     p.add_argument("--root", type=str, required=True,
                    help="folder containing images or subfolders of images")
     p.add_argument("--out_dir", type=str, default="data/clip_ref")
-    p.add_argument("--model_id", type=str, default="openai/clip-vit-large-patch14-336",
+    p.add_argument("--model_id", type=str, default="openai/clip-vit-large-patch14",
                    help="HuggingFace CLIP model ID")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=4)
