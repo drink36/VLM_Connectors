@@ -205,10 +205,15 @@ def _numeric_suffix(p: Path) -> int:
 
 
 class ConnectorTrainDataset(Dataset):
-    """Loads pre_vectors_*.pt shards + captions. Optionally loads post vecs for geo reg."""
+    """Loads pre_vectors_*.pt shards + captions. Optionally loads post vecs for geo reg.
+
+    If gt_caption_dir is given, captions are loaded from <gt_caption_dir>/<key>.txt
+    instead of the shard's own 'caps' field. Samples missing a GT file are skipped.
+    """
 
     def __init__(self, vec_dir: str, limit: int = 0,
-                 cache_shards: int = 2, load_post: bool = False):
+                 cache_shards: int = 2, load_post: bool = False,
+                 gt_caption_dir: Optional[str] = None):
         root = Path(vec_dir)
         self.pre_files = sorted(root.glob("pre_vectors_*.pt"), key=_numeric_suffix)
         self.post_files = sorted(root.glob("post_vectors_*.pt"), key=_numeric_suffix) if load_post else []
@@ -217,6 +222,7 @@ class ConnectorTrainDataset(Dataset):
 
         self.load_post = load_post
         self.cache_shards = max(1, cache_shards)
+        self.gt_dir = Path(gt_caption_dir) if gt_caption_dir else None
 
         pre_map = {_numeric_suffix(p): p for p in self.pre_files}
         post_map = {_numeric_suffix(p): p for p in self.post_files} if load_post else {}
@@ -228,16 +234,28 @@ class ConnectorTrainDataset(Dataset):
         self.post_map = post_map
 
         self.items: list[tuple[int, int, str]] = []
+        skipped = 0
         seen = 0
         for tag in tags:
             obj = torch.load(pre_map[tag], map_location="cpu", weights_only=False)
             for row_idx, key in enumerate(obj["keys"]):
-                self.items.append((tag, row_idx, str(key)))
+                key = str(key)
+                if self.gt_dir is not None:
+                    gt_path = self.gt_dir / f"{key}.txt"
+                    if not gt_path.exists():
+                        skipped += 1
+                        continue
+                self.items.append((tag, row_idx, key))
                 seen += 1
                 if limit and seen >= limit:
                     break
             if limit and seen >= limit:
                 break
+
+        if skipped:
+            print(f"[dataset] skipped {skipped} samples with no GT caption file")
+        print(f"[dataset] {len(self.items)} samples from {vec_dir}"
+              + (" (GT captions)" if self.gt_dir else " (shard captions)"))
 
         self.pre_cache: OrderedDict = OrderedDict()
         self.post_cache: OrderedDict = OrderedDict()
@@ -264,11 +282,16 @@ class ConnectorTrainDataset(Dataset):
             post_obj = torch.load(self.post_map[tag], map_location="cpu", weights_only=False)
             self.post_cache[tag] = post_obj["vecs"].float()
 
+    def _get_cap(self, tag: int, row: int, key: str) -> str:
+        if self.gt_dir is not None:
+            return (self.gt_dir / f"{key}.txt").read_text(encoding="utf-8").strip()
+        return self.cap_cache[tag][row]
+
     def __getitem__(self, idx: int) -> dict:
         tag, row, key = self.items[idx]
         self._load_tag(tag)
         pre = self.pre_cache[tag][row]   # [T, D_pre]
-        cap = self.cap_cache[tag][row]
+        cap = self._get_cap(tag, row, key)
         item = {"pre": pre, "cap": cap, "sample_id": key}
         if self.load_post:
             item["post"] = self.post_cache[tag][row]
@@ -466,7 +489,8 @@ def train(args):
     # Dataset
     load_post = args.geo_reg_weight > 0
     ds = ConnectorTrainDataset(args.vec_dir, limit=args.limit,
-                               cache_shards=args.cache_shards, load_post=load_post)
+                               cache_shards=args.cache_shards, load_post=load_post,
+                               gt_caption_dir=args.gt_caption_dir or None)
     n_val = max(1, int(len(ds) * (1 - args.train_split)))
     n_train = len(ds) - n_val
     train_ds, val_ds = torch.utils.data.random_split(
@@ -660,8 +684,10 @@ def parse_args():
     p.add_argument("--cache_shards", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=0)
 
-    # Caption prompt
+    # Caption source
     p.add_argument("--caption_prompt", type=str, default="What do you see in this image?")
+    p.add_argument("--gt_caption_dir", type=str, default="",
+                   help="directory with <key>.txt GT captions; if set, used instead of shard captions")
 
     # Output
     p.add_argument("--out_dir", type=str, default="train_connector_out")

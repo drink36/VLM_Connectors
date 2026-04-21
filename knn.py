@@ -6,10 +6,21 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
+def _find_shard_folders(root: Path, prefix: str) -> list[Path]:
+    """Return sorted list of folders that contain {prefix}_vectors_*.pt files."""
+    folders = sorted([
+        d for d in root.iterdir()
+        if d.is_dir() and list(d.glob(f"{prefix}_vectors_*.pt"))
+    ])
+    return folders
+
+
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--pre_pt", type=str, required=True, help="pre .pt file OR directory containing pre_vectors_*.pt")
-    p.add_argument("--post_pt", type=str, required=True, help="post .pt file OR directory containing post_vectors_*.pt")
+    p.add_argument("--pre_pt", type=str, required=True,
+                   help="pre .pt file, shard dir, or parent dir containing shard subdirs (e.g. data/vector/llava)")
+    p.add_argument("--post_pt", type=str, required=True,
+                   help="post .pt file, shard dir, or parent dir containing shard subdirs")
     p.add_argument("--out_dir", type=str, default="knn_overlap_out")
     p.add_argument("--topk", type=int, default=100)
     p.add_argument("--metric", type=str, default="cosine", choices=["cosine", "l2"])
@@ -24,14 +35,20 @@ def parse_args():
     p.add_argument("--min_q_chunk", type=int, default=8)
     p.add_argument("--min_g_chunk", type=int, default=64)
     p.add_argument("--sv_topn", type=int, default=128, help="store only top-N singular values in json")
+    p.add_argument("--ref", type=str, action="append", default=[],
+                   metavar="LABEL:PATH",
+                   help="reference dir with label, e.g. --ref clip:data/clip_ref/00000 --ref dino:data/dino_ref/00000 (repeatable)")
+    # legacy single-ref args kept for backward compatibility
     p.add_argument("--ref_pt", type=str, default="",
-                   help="path to first reference dir (e.g. CLIP) containing ref_vectors_*.pt")
+                   help="(legacy) path to first reference dir; use --ref label:path instead")
     p.add_argument("--ref_pt2", type=str, default="",
-                   help="path to second reference dir (e.g. DINOv2) containing ref_vectors_*.pt")
+                   help="(legacy) path to second reference dir; use --ref label:path instead")
     p.add_argument("--ref_label", type=str, default="clip",
-                   help="label for --ref_pt results in JSON output (default: clip)")
+                   help="(legacy) label for --ref_pt")
     p.add_argument("--ref2_label", type=str, default="dino",
-                   help="label for --ref_pt2 results in JSON output (default: dino)")
+                   help="(legacy) label for --ref_pt2")
+    p.add_argument("--svd_per_image_csv", action="store_true",
+                   help="write per-image SVD scalars to svd_per_image.csv for correlation analysis")
     return p.parse_args()
 
 
@@ -566,6 +583,8 @@ def _run_ref_knor(label, ref_pt, keys, pre_lut, post_lut, args, device, safe_mod
         "pairwise_corr_ref_post": ps_ref_post,
     }
 
+    per_image_ref: dict[str, dict] = {k: {} for k in common_3way}
+
     for k in [10, 50, 100]:
         if ref_I.size(1) >= k and pre_I_3.size(1) >= k:
             ov_rp = overlap(ref_I, pre_I_3, k)
@@ -577,6 +596,8 @@ def _run_ref_knor(label, ref_pt, keys, pre_lut, post_lut, args, device, safe_mod
                 "mean_rank_displacement": float(md_rp.mean().item()),
                 "pairwise_corr_ref_pre": ps_ref_pre,
             }
+            for i, key in enumerate(common_3way):
+                per_image_ref[key][f"{label}_pre_knor{k}"] = float(ov_rp[i].item())
         if ref_I.size(1) >= k and post_I_3.size(1) >= k:
             ov_rq = overlap(ref_I, post_I_3, k)
             md_rq = mean_rank_displacement(ref_I, post_I_3, k)
@@ -587,6 +608,12 @@ def _run_ref_knor(label, ref_pt, keys, pre_lut, post_lut, args, device, safe_mod
                 "mean_rank_displacement": float(md_rq.mean().item()),
                 "pairwise_corr_ref_post": ps_ref_post,
             }
+            for i, key in enumerate(common_3way):
+                per_image_ref[key][f"{label}_post_knor{k}"] = float(ov_rq[i].item())
+
+    results.setdefault("_per_image_ref", {})
+    for key, scores in per_image_ref.items():
+        results["_per_image_ref"].setdefault(key, {}).update(scores)
 
     del ref_vec, pre_vec_3, post_vec_3, ref_I, pre_I_3, post_I_3
     gc.collect()
@@ -606,9 +633,69 @@ def _run_ref_knor(label, ref_pt, keys, pre_lut, post_lut, args, device, safe_mod
             )
 
 
+def _run_one_shard(args, pre_pt: str, post_pt: str, ref_list: list, out_dir: str):
+    """Run KNN analysis on a single shard folder. Mutates args temporarily."""
+    _orig_pre, _orig_post, _orig_out, _orig_ref = args.pre_pt, args.post_pt, args.out_dir, args.ref
+    args.pre_pt = pre_pt
+    args.post_pt = post_pt
+    args.out_dir = out_dir
+    args.ref = ref_list
+    try:
+        _main_single(args)
+    finally:
+        args.pre_pt, args.post_pt, args.out_dir, args.ref = _orig_pre, _orig_post, _orig_out, _orig_ref
+
+
 def main():
     args = parse_args()
 
+    pre_root = Path(args.pre_pt)
+    post_root = Path(args.post_pt)
+
+    # Detect if pre_pt is a parent directory of shard subdirs
+    pre_shard_dirs = _find_shard_folders(pre_root, "pre") if pre_root.is_dir() else []
+    post_shard_dirs = _find_shard_folders(post_root, "post") if post_root.is_dir() else []
+
+    is_multi = bool(pre_shard_dirs and post_shard_dirs)
+
+    if is_multi:
+        # Match shard folders by name
+        pre_map = {d.name: d for d in pre_shard_dirs}
+        post_map = {d.name: d for d in post_shard_dirs}
+        common_shards = sorted(set(pre_map) & set(post_map))
+        print(f"Multi-shard mode: {len(common_shards)} shards found under {pre_root}")
+
+        base_out = Path(args.out_dir)
+        base_ref_list = []
+        for entry in args.ref:
+            if ":" not in entry:
+                raise ValueError(f"--ref must be label:path, got: {entry!r}")
+            label, path = entry.split(":", 1)
+            base_ref_list.append((label.strip(), Path(path.strip())))
+
+        for shard in common_shards:
+            print(f"\n{'='*60}\nProcessing shard: {shard}\n{'='*60}")
+            shard_ref_list = []
+            for label, ref_root_path in base_ref_list:
+                shard_ref_dir = ref_root_path / shard
+                if shard_ref_dir.exists():
+                    shard_ref_list.append(f"{label}:{shard_ref_dir}")
+                else:
+                    print(f"[warn] ref {label} has no folder for shard {shard}, skipping")
+            _run_one_shard(
+                args,
+                pre_pt=str(pre_map[shard]),
+                post_pt=str(post_map[shard]),
+                ref_list=shard_ref_list,
+                out_dir=str(base_out / shard),
+            )
+        return
+
+    # Single shard / file path — original behavior
+    _main_single(args)
+
+
+def _main_single(args):
     pre_files = _resolve_files(args.pre_pt, "pre")
     post_files = _resolve_files(args.post_pt, "post")
     if args.device == "auto":
@@ -673,6 +760,10 @@ def main():
     )
     sv_pre_summary = summarize_spectrum_list(sv_pre_list)
     sv_post_summary = summarize_spectrum_list(sv_post_list)
+
+    # stash for CSV write after ref KNOR
+    _sv_pre_list = sv_pre_list
+    _sv_post_list = sv_post_list
     del sv_pre_list, sv_post_list
     gc.collect()
     cos_pre_list = compute_cosine_stats_streaming(keys, pre_lut, load_device=device)
@@ -722,6 +813,7 @@ def main():
         },
     }
 
+    per_image_knor: dict[str, dict] = {k: {} for k in keys}
     for k in [10, 50, 100]:
         if pre_I.size(1) >= k:
             ov = overlap(pre_I, post_I, k)
@@ -735,6 +827,9 @@ def main():
                 "std_rank_displacement": float(md.std(unbiased=False).item()),
                 "pairwise_corr": ps,
             }
+            for i, key in enumerate(keys):
+                per_image_knor[key][f"pre_post_knor{k}"] = float(ov[i].item())
+    results["_per_image_knor"] = per_image_knor
 
     # -------------------------
     # Optional: N-way KNOR with image references (CLIP, DINOv2, etc.)
@@ -743,17 +838,58 @@ def main():
     # Comparing KNN against neutral image references reveals whether low pre→post KNOR
     # is caused by an unusual pre-space (joint training) vs genuine information loss.
     # -------------------------
+    # Build unified ref list from --ref entries + legacy --ref_pt/--ref_pt2
+    ref_list = []
+    for entry in args.ref:
+        if ":" not in entry:
+            raise ValueError(f"--ref must be label:path, got: {entry!r}")
+        label, path = entry.split(":", 1)
+        ref_list.append((label.strip(), path.strip()))
     if args.ref_pt:
-        if args.pool == "none":
-            print(f"[{args.ref_label}] --pool none is not compatible with image-level reference; skipping")
-        else:
-            _run_ref_knor(args.ref_label, args.ref_pt, keys, pre_lut, post_lut, args, device, safe_mode, results)
-
+        ref_list.append((args.ref_label, args.ref_pt))
     if args.ref_pt2:
+        ref_list.append((args.ref2_label, args.ref_pt2))
+
+    for label, path in ref_list:
         if args.pool == "none":
-            print(f"[{args.ref2_label}] --pool none is not compatible with image-level reference; skipping")
+            print(f"[{label}] --pool none is not compatible with image-level reference; skipping")
         else:
-            _run_ref_knor(args.ref2_label, args.ref_pt2, keys, pre_lut, post_lut, args, device, safe_mode, results)
+            _run_ref_knor(label, path, keys, pre_lut, post_lut, args, device, safe_mode, results)
+
+    if args.svd_per_image_csv:
+        import csv
+        csv_path = out_dir / "per_image.csv"
+        scalar_cols = ["effective_rank", "effective_rank_normalized",
+                       "top1_energy_ratio", "top5_energy_ratio", "top10_energy_ratio",
+                       "k80_energy", "k90_energy"]
+        per_image_ref = results.pop("_per_image_ref", {})
+        per_image_knor = results.pop("_per_image_knor", {})
+        # collect all extra column names from ref KNOR
+        ref_cols: list[str] = []
+        for v in per_image_ref.values():
+            for c in v:
+                if c not in ref_cols:
+                    ref_cols.append(c)
+        knor_cols = [f"pre_post_knor{k}" for k in [10, 50, 100]]
+        fieldnames = (["key"]
+                      + [f"pre_{c}" for c in scalar_cols]
+                      + [f"post_{c}" for c in scalar_cols]
+                      + knor_cols + ref_cols)
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            for key, pre_s, post_s in zip(keys, _sv_pre_list, _sv_post_list):
+                row = {"key": key}
+                for c in scalar_cols:
+                    row[f"pre_{c}"] = pre_s[c]
+                    row[f"post_{c}"] = post_s[c]
+                row.update(per_image_knor.get(key, {}))
+                row.update(per_image_ref.get(key, {}))
+                w.writerow(row)
+        print(f"Per-image CSV saved: {csv_path}")
+    else:
+        results.pop("_per_image_ref", None)
+        results.pop("_per_image_knor", None)
 
     with open(out_dir / f"overlap_top{args.topk}_{args.metric}_torch.json", "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)

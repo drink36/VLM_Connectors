@@ -1,6 +1,4 @@
 import argparse
-import glob
-import hashlib
 import itertools
 import math
 import os
@@ -15,6 +13,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
 from torch.amp import autocast
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -27,9 +27,6 @@ from transformers import (
 from transformers.image_utils import load_image
 
 
-# -----------------------------
-# Dataset
-# -----------------------------
 
 class ShardSample(TypedDict):
     embeddings: tuple[torch.Tensor, torch.Tensor]
@@ -176,49 +173,20 @@ class ShardPairVectorDataset(Dataset):
         return {"embeddings": (pre, post), "sample_id": sample_id}
 
 
-# -----------------------------
-# Reconstruction models
-# -----------------------------
 
 class EmbeddingTransformer(nn.Module):
     def __init__(self, input_dim=4096, output_dim=1024, hidden_dim=2048, num_layers=3):
         super().__init__()
         hidden_dim = min(hidden_dim, max(input_dim, output_dim))
 
-        if num_layers <= 3:
-            self.model = nn.Sequential(
-                nn.Linear(input_dim, input_dim),
-                nn.LayerNorm(input_dim),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(input_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_dim, output_dim),
-            )
-        else:
-            layers: list[nn.Module] = [
-                nn.Linear(input_dim, input_dim),
-                nn.LayerNorm(input_dim),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(input_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(0.1),
-            ]
-            for _ in range(num_layers - 3):
-                layers.extend(
-                    [
-                        nn.Linear(hidden_dim, hidden_dim),
-                        nn.LayerNorm(hidden_dim),
-                        nn.GELU(),
-                        nn.Dropout(0.1),
-                    ]
-                )
-            layers.append(nn.Linear(hidden_dim, output_dim))
-            self.model = nn.Sequential(*layers)
+        layers: list[nn.Module] = [
+            nn.Linear(input_dim, input_dim), nn.LayerNorm(input_dim), nn.GELU(), nn.Dropout(0.1),
+            nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), nn.Dropout(0.1),
+        ]
+        for _ in range(num_layers - 3):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), nn.Dropout(0.1)]
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.model = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -311,9 +279,6 @@ class SeqEmbeddingTransformer(nn.Module):
         return self.output_projection(x)
 
 
-# -----------------------------
-# Utility helpers
-# -----------------------------
 
 def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     if args.embed_model == "llava":
@@ -352,6 +317,16 @@ def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
             num_layers=args.num_layers,
             num_heads=args.num_heads,
         )
+    elif args.embed_model == "qwen3.5":
+        model = SeqEmbeddingTransformer(
+            input_dim=4096,
+            input_seq_len=100,
+            output_seq_len=400,
+            output_dim=1152,
+            hidden_dim=args.hidden_size,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+        )
     else:
         raise ValueError(f"unsupported embed_model: {args.embed_model}")
     return model.to(device)
@@ -379,10 +354,6 @@ def resolve_model_path(args: argparse.Namespace) -> str:
     raise FileNotFoundError("no checkpoint found; provide --model_path or valid --model_dir")
 
 
-def get_autocast_dtype(args: argparse.Namespace) -> torch.dtype:
-    return torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-
-
 def standardize_embeddings(embeddings: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     return (embeddings - mean) / (std + 1e-8)
 
@@ -404,21 +375,19 @@ def extract_key_from_sample_id(sample_id: str) -> str:
 
 
 def build_image_index(image_dir: str) -> dict[str, str]:
-    patterns = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp")
+    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
     key_to_path: dict[str, str] = {}
-    for pattern in patterns:
-        for path in glob.glob(os.path.join(image_dir, "**", pattern), recursive=True):
-            key = Path(path).stem
-            if key in key_to_path and key_to_path[key] != path:
-                print(f"[warn] duplicate image key {key}; keeping first path")
-                continue
-            key_to_path[key] = path
+    for path in Path(image_dir).rglob("*"):
+        if path.suffix.lower() not in exts:
+            continue
+        key = path.stem
+        if key in key_to_path and key_to_path[key] != str(path):
+            print(f"[warn] duplicate image key {key}; keeping first path")
+            continue
+        key_to_path[key] = str(path)
     return key_to_path
 
 
-# -----------------------------
-# VLM loading + prompting
-# -----------------------------
 
 def resolve_vlm_model_id(args: argparse.Namespace) -> str:
     if args.vlm_model_id:
@@ -429,6 +398,8 @@ def resolve_vlm_model_id(args: argparse.Namespace) -> str:
         return "HuggingFaceM4/idefics2-8b"
     if args.embed_model == "qwen2.5vl":
         return "Qwen/Qwen2.5-VL-7B-Instruct"
+    if args.embed_model == "qwen3.5":
+        return "Qwen/Qwen3.5-9B"
     raise ValueError(f"no default VLM id for embed_model={args.embed_model}; set --vlm_model_id")
 
 
@@ -449,12 +420,12 @@ def load_vlm_for_caption(args: argparse.Namespace, device: torch.device):
         model = Idefics2ForConditionalGeneration.from_pretrained(
             model_id, torch_dtype=dtype, trust_remote_code=True
         )
-    elif args.embed_model == "qwen2.5vl":
+    elif args.embed_model in ("qwen2.5vl", "qwen3.5"):
         model = AutoModelForImageTextToText.from_pretrained(
             model_id, torch_dtype=dtype, trust_remote_code=True
         )
     else:
-        raise ValueError("caption compare supports only llava / idefics2 / qwen2.5vl")
+        raise ValueError(f"caption compare supports only llava / idefics2 / qwen2.5vl / qwen3.5")
 
     model = model.to(device)
     model.eval()
@@ -473,35 +444,15 @@ def build_vlm_inputs(
     if img_size and img_size > 0:
         images = [im.resize((img_size, img_size)) for im in images]
 
-    if embed_model == "llava":
-        template = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
-        prompts = [processor.apply_chat_template(template, add_generation_prompt=True) for _ in images]
-        inputs = processor(images=images, text=prompts, padding=True, return_tensors="pt")
+    if embed_model in ("llava", "idefics2"):
+        template = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
+        text = processor.apply_chat_template(template, add_generation_prompt=True)
+        prompts = [text] * len(images)
+        img_arg = images if embed_model == "llava" else [[im] for im in images]
+        inputs = processor(images=img_arg, text=prompts, padding=True, return_tensors="pt")
         return {k: v.to(device) for k, v in inputs.items()}
 
-    if embed_model == "idefics2":
-        template = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
-        prompts = [processor.apply_chat_template(template, add_generation_prompt=True) for _ in images]
-        inputs = processor(images=[[im] for im in images], text=prompts, padding=True, return_tensors="pt")
-        return {k: v.to(device) for k, v in inputs.items()}
-
-    if embed_model == "qwen2.5vl":
+    if embed_model in ("qwen2.5vl", "qwen3.5"):
         from qwen_vl_utils import process_vision_info
 
         templates = [
@@ -516,7 +467,8 @@ def build_vlm_inputs(
             ]
             for im in images
         ]
-        texts = [processor.apply_chat_template(t, tokenize=False, add_generation_prompt=True) for t in templates]
+        tmpl_kwargs = {"enable_thinking": False} if embed_model == "qwen3.5" else {}
+        texts = [processor.apply_chat_template(t, tokenize=False, add_generation_prompt=True, **tmpl_kwargs) for t in templates]
         image_inputs, video_inputs = process_vision_info(templates)
         inputs = processor(
             text=texts,
@@ -531,8 +483,7 @@ def build_vlm_inputs(
 
 
 def get_prompt_token_len(processor, input_ids: torch.Tensor, embed_model: str) -> list[int]:
-    # For these models left padding is usually not used in this workflow.
-    if embed_model == "qwen2.5vl":
+    if embed_model in ("qwen2.5vl", "qwen3.5"):
         pad_id = processor.tokenizer.pad_token_id
         if pad_id is None:
             return [input_ids.shape[1]] * input_ids.shape[0]
@@ -541,9 +492,7 @@ def get_prompt_token_len(processor, input_ids: torch.Tensor, embed_model: str) -
 
 
 def decode_outputs(processor, out_ids: torch.Tensor, input_ids: torch.Tensor, embed_model: str) -> list[str]:
-    # Keep decode behavior identical to extraction so caption text is comparable.
-    # For qwen we may have per-sample prompt lengths depending on padding.
-    if embed_model == "qwen2.5vl":
+    if embed_model in ("qwen2.5vl", "qwen3.5"):
         prompt_lens = get_prompt_token_len(processor, input_ids, embed_model)
         texts: list[str] = []
         for i, plen in enumerate(prompt_lens):
@@ -565,9 +514,6 @@ def decode_outputs(processor, out_ids: torch.Tensor, input_ids: torch.Tensor, em
     return [c.strip() for c in captions]
 
 
-# -----------------------------
-# Connector hooks
-# -----------------------------
 
 def resolve_connector_module(vlm_model: nn.Module, embed_model: str) -> nn.Module:
     mods = dict(vlm_model.named_modules())
@@ -575,7 +521,7 @@ def resolve_connector_module(vlm_model: nn.Module, embed_model: str) -> nn.Modul
         mod = mods.get("multi_modal_projector") or mods.get("model.multi_modal_projector")
     elif embed_model == "idefics2":
         mod = mods.get("model.connector") or mods.get("connector")
-    elif embed_model == "qwen2.5vl":
+    elif embed_model in ("qwen2.5vl", "qwen3.5"):
         mod = mods.get("visual.merger") or mods.get("model.visual.merger")
     else:
         mod = None
@@ -669,120 +615,9 @@ def per_sample_cosine(pred: torch.Tensor, target: torch.Tensor) -> np.ndarray:
     raise RuntimeError(f"unexpected tensor dim for cosine: {pred_f.dim()}")
 
 
-def stable_seed(base_seed: int, text: str) -> int:
-    payload = f"{base_seed}:{text}".encode("utf-8")
-    digest = hashlib.blake2b(payload, digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="big", signed=False)
 
 
-def should_apply_perturbation(args: argparse.Namespace, path_mode: str) -> bool:
-    if args.perturbation_mode == "none":
-        return False
-    if args.perturbation_paths == "all":
-        return True
-    return args.perturbation_paths == path_mode
 
-
-def _effective_rank_from_level(level: float, max_rank: int) -> int:
-    if max_rank <= 0:
-        return 0
-    if level <= 0:
-        return 1
-    if level <= 1.0:
-        return max(1, min(max_rank, int(round(level * max_rank))))
-    return max(1, min(max_rank, int(round(level))))
-
-
-def get_orthogonal_basis(
-    dim: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    seed: int,
-    cache: dict[tuple[int, str, torch.dtype, int], torch.Tensor],
-) -> torch.Tensor:
-    key = (dim, str(device), dtype, int(seed))
-    if key in cache:
-        return cache[key]
-
-    gen = torch.Generator(device=device)
-    gen.manual_seed(int(seed))
-    a = torch.randn((dim, dim), generator=gen, device=device, dtype=torch.float32)
-    q, r = torch.linalg.qr(a)
-    signs = torch.sign(torch.diagonal(r))
-    signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-    q = q * signs
-    q = q.to(dtype=dtype)
-    cache[key] = q
-    return q
-
-
-def apply_post_perturbation(
-    post_tokens: torch.Tensor,
-    mode: str,
-    level: float,
-    sample_ids: list[str],
-    base_seed: int,
-    orth_cache: dict[tuple[int, str, torch.dtype, int], torch.Tensor],
-) -> torch.Tensor:
-    if mode == "none":
-        return post_tokens
-
-    squeeze_back = False
-    work = post_tokens
-    if work.dim() == 2:
-        work = work.unsqueeze(0)
-        squeeze_back = True
-    if work.dim() != 3:
-        raise RuntimeError(f"unsupported post token dim for perturbation: {work.dim()}")
-
-    batch = work.shape[0]
-    if len(sample_ids) != batch:
-        raise RuntimeError(f"sample_ids length mismatch: expected {batch}, got {len(sample_ids)}")
-
-    out = work.clone()
-    mode = mode.lower()
-
-    if mode == "mask":
-        frac = float(max(0.0, min(1.0, level)))
-        for b in range(batch):
-            sample_seed = stable_seed(base_seed, sample_ids[b])
-            gen = torch.Generator(device=out.device)
-            gen.manual_seed(sample_seed)
-            token_count = out.shape[1]
-            mask = torch.rand((token_count,), generator=gen, device=out.device) < frac
-            out[b, mask, :] = 0
-
-    elif mode == "lowrank":
-        for b in range(batch):
-            x = out[b].float()
-            mean = x.mean(dim=0, keepdim=True)
-            x_centered = x - mean
-            u, s, vh = torch.linalg.svd(x_centered, full_matrices=False)
-            rank = _effective_rank_from_level(float(level), s.shape[0])
-            approx = (u[:, :rank] * s[:rank]) @ vh[:rank, :]
-            out[b] = (approx + mean).to(dtype=out.dtype)
-
-    elif mode == "orthogonal":
-        alpha = float(max(0.0, min(1.0, level)))
-        q = get_orthogonal_basis(
-            dim=out.shape[-1],
-            device=out.device,
-            dtype=out.dtype,
-            seed=int(base_seed),
-            cache=orth_cache,
-        )
-        rotated = out @ q
-        out = (1.0 - alpha) * out + alpha * rotated
-
-    else:
-        raise ValueError(f"unknown perturbation mode: {mode}")
-
-    return out.squeeze(0) if squeeze_back else out
-
-
-# -----------------------------
-# Main caption compare
-# -----------------------------
 
 def run_caption_compare(
     recon_model: nn.Module,
@@ -800,6 +635,31 @@ def run_caption_compare(
     if not key_to_path:
         raise FileNotFoundError(f"no images found under {args.image_dir}")
 
+    # Load CLIP for inline CLIPScore
+    from transformers import CLIPModel, AutoProcessor as _AutoProcessor
+    clip_processor = _AutoProcessor.from_pretrained(args.clip_model_id)
+    clip_model = CLIPModel.from_pretrained(args.clip_model_id, use_safetensors=True).to(device).eval()
+
+    @torch.no_grad()
+    def _clipscore(image_paths, captions):
+        scores = [float("nan")] * len(image_paths)
+        valid = [(i, p, c) for i, (p, c) in enumerate(zip(image_paths, captions)) if p and c]
+        if not valid:
+            return scores
+        idxs, paths, caps = zip(*valid)
+        images = [Image.open(p).convert("RGB") for p in paths]
+        inputs = clip_processor(
+            text=list(caps), images=images,
+            padding=True, truncation=True, return_tensors="pt",
+        ).to(device)
+        out = clip_model(**inputs)
+        img_e = F.normalize(out.image_embeds, dim=-1)
+        txt_e = F.normalize(out.text_embeds, dim=-1)
+        vals = torch.clamp(100.0 * (img_e * txt_e).sum(dim=-1), min=0.0).cpu().tolist()
+        for i, v in zip(idxs, vals):
+            scores[i] = v
+        return scores
+
     recon_model.eval()
     recon_stats = maybe_load_recon_stats(args.recon_stats_path)
     if args.normalize_recon_input and recon_stats is None:
@@ -811,23 +671,41 @@ def run_caption_compare(
     use_amp = bool(args.amp and device.type == "cuda")
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
 
-    rows: list[dict] = []
-    orth_cache: dict[tuple[int, str, torch.dtype, int], torch.Tensor] = {}
+    os.makedirs(args.out_dir, exist_ok=True)
+    out_csv = os.path.join(args.out_dir, args.caption_csv_name)
+
+    # Resume: load already-done keys
+    done_keys: set[str] = set()
+    if os.path.exists(out_csv):
+        try:
+            done_keys = set(pd.read_csv(out_csv)["key"].astype(str).tolist())
+            print(f"[resume] found {len(done_keys)} already-done keys in {out_csv}")
+        except Exception:
+            pass
+
+    csv_file = open(out_csv, "a", newline="", encoding="utf-8")
+    write_header = (len(done_keys) == 0)
+
     missing_images = 0
     processed = 0
     if args.max_items != 0:
         print(f"[info] max_items is set to {args.max_items}, will process at most {args.max_items} batches.")
-        # Keep this lazy: list(loader) would materialize the full dataset in RAM.
         loader = itertools.islice(loader, args.max_items)
 
+    tqdm_total = None
+    if args.caption_limit > 0:
+        tqdm_total = math.ceil(args.caption_limit / args.batch_size)
+    elif args.max_items != 0:
+        tqdm_total = args.max_items
+
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Caption Compare"):
+        for batch in tqdm(loader, desc="Caption Compare", total=tqdm_total):
             sample_ids = list(batch["sample_id"])
             post_emb_cpu = batch["embeddings"][1]
             keys = [extract_key_from_sample_id(sid) for sid in sample_ids]
             image_paths = [key_to_path.get(k, "") for k in keys]
 
-            kept_idx = [i for i, p in enumerate(image_paths) if p]
+            kept_idx = [i for i, p in enumerate(image_paths) if p and keys[i] not in done_keys]
             if not kept_idx:
                 missing_images += len(sample_ids)
                 continue
@@ -862,21 +740,14 @@ def run_caption_compare(
                 img_size=args.img_size,
             )
 
-            if args.compare_post_vs_recon and args.compare_only_two_paths:
-                caps_original = [""] * len(kept_paths)
-            else:
-                with autocast(device_type=device.type, enabled=use_amp, dtype=autocast_dtype):
-                    out_original = vlm_model.generate(
-                        **vlm_inputs,
-                        max_new_tokens=args.caption_max_new_tokens,
-                        do_sample=False,
-                        use_cache=False,
-                    )
-                caps_original = decode_outputs(processor, out_original, vlm_inputs["input_ids"], args.embed_model)
+            # GT captions from .txt files (image vs GT = reference CLIPScore)
+            gt_caps = []
+            for p in kept_paths:
+                txt = Path(p).with_suffix(".txt")
+                gt_caps.append(txt.read_text(encoding="utf-8").strip() if txt.exists() else "")
 
             def run_injected(path_mode: str) -> tuple[list[str], np.ndarray, np.ndarray]:
                 hook_state = {"pre_fired": False, "fwd_fired": False, "captured_post": None}
-                apply_perturb = should_apply_perturbation(args, path_mode)
 
                 def replace_connector_input(_module, hook_in):
                     x = hook_in[0]
@@ -887,23 +758,11 @@ def run_caption_compare(
                 def replace_connector_output(_module, _hook_in, hook_out):
                     out_tensor = tensorize_output(hook_out)
                     if path_mode == "post_direct":
-                        base_post = post_gt
+                        post_for_decode = post_gt
                     elif path_mode == "recon":
-                        base_post = reshape_like(out_tensor, post_gt)
+                        post_for_decode = reshape_like(out_tensor, post_gt)
                     else:
                         raise ValueError(f"unknown path mode: {path_mode}")
-
-                    if apply_perturb:
-                        post_for_decode = apply_post_perturbation(
-                            post_tokens=base_post,
-                            mode=args.perturbation_mode,
-                            level=args.perturbation_level,
-                            sample_ids=kept_sample_ids,
-                            base_seed=args.perturbation_seed,
-                            orth_cache=orth_cache,
-                        )
-                    else:
-                        post_for_decode = base_post
 
                     repl = reshape_like(post_for_decode, out_tensor).to(
                         dtype=out_tensor.dtype,
@@ -921,10 +780,7 @@ def run_caption_compare(
 
                 if path_mode == "recon":
                     h1 = connector.register_forward_pre_hook(replace_connector_input)
-                    if apply_perturb:
-                        h2 = connector.register_forward_hook(replace_connector_output)
-                    else:
-                        h2 = connector.register_forward_hook(capture_connector_output)
+                    h2 = connector.register_forward_hook(capture_connector_output)
                 elif path_mode == "post_direct":
                     h1 = None
                     h2 = connector.register_forward_hook(replace_connector_output)
@@ -937,7 +793,6 @@ def run_caption_compare(
                             **vlm_inputs,
                             max_new_tokens=args.caption_max_new_tokens,
                             do_sample=False,
-                            use_cache=False,
                         )
                 finally:
                     if h1 is not None:
@@ -960,85 +815,85 @@ def run_caption_compare(
             if args.compare_post_vs_recon:
                 caps_post, mse_post, cos_post = run_injected("post_direct")
                 caps_recon, mse_recon, cos_recon = run_injected("recon")
-
-                for sid, key, path, c0, c_post, c_recon, mse_p, cos_p, mse_r, cos_r in zip(
-                    kept_sample_ids,
-                    kept_keys,
-                    kept_paths,
-                    caps_original,
-                    caps_post,
-                    caps_recon,
-                    mse_post,
-                    cos_post,
-                    mse_recon,
-                    cos_recon,
-                ):
-                    rows.append(
-                        {
-                            "sample_id": sid,
-                            "key": key,
-                            "image_path": path,
-                            "caption_original": c0,
-                            "caption_post_direct": c_post,
-                            "caption_recon": c_recon,
-                            "reproj_mse_post_direct": float(mse_p),
-                            "reproj_cosine_post_direct": float(cos_p),
-                            "reproj_mse_recon": float(mse_r),
-                            "reproj_cosine_recon": float(cos_r),
-                            # Keep legacy columns for compatibility with existing scripts.
-                            "reproj_mse": float(mse_r),
-                            "reproj_cosine": float(cos_r),
-                            "perturbation_mode": args.perturbation_mode,
-                            "perturbation_level": float(args.perturbation_level),
-                            "perturbation_seed": int(args.perturbation_seed),
-                            "perturbation_paths": args.perturbation_paths,
-                            "perturbation_run_id": args.perturbation_run_id,
-                        }
+                cs_gt    = _clipscore(kept_paths, gt_caps)
+                cs_post  = _clipscore(kept_paths, caps_post)
+                cs_recon = _clipscore(kept_paths, caps_recon)
+                batch_rows = [
+                    {
+                        "sample_id": sid, "key": key,
+                        "folder_id": Path(path).parent.name if path else "",
+                        "model": args.embed_model,
+                        "image_path": path,
+                        "caption_post_direct": c_post,
+                        "caption_recon": c_recon,
+                        "reproj_mse_post_direct": float(mse_p),
+                        "reproj_cosine_post_direct": float(cos_p),
+                        "reproj_mse_recon": float(mse_r),
+                        "reproj_cosine_recon": float(cos_r),
+                        "clipscore_gt": float(cs_g),
+                        "clipscore_post_direct": float(cs_p),
+                        "clipscore_recon": float(cs_r),
+                        "clipscore_drop": float(cs_p - cs_r),
+                    }
+                    for sid, key, path, c_post, c_recon, mse_p, cos_p, mse_r, cos_r, cs_g, cs_p, cs_r in zip(
+                        kept_sample_ids, kept_keys, kept_paths,
+                        caps_post, caps_recon,
+                        mse_post, cos_post, mse_recon, cos_recon,
+                        cs_gt, cs_post, cs_recon,
                     )
+                ]
             else:
                 caps_recon, mse_vals, cos_vals = run_injected("recon")
-
-                for sid, key, path, c0, c1, mse_v, cos_v in zip(
-                    kept_sample_ids,
-                    kept_keys,
-                    kept_paths,
-                    caps_original,
-                    caps_recon,
-                    mse_vals,
-                    cos_vals,
-                ):
-                    rows.append(
-                        {
-                            "sample_id": sid,
-                            "key": key,
-                            "image_path": path,
-                            "caption_original": c0,
-                            "caption_recon": c1,
-                            "reproj_mse": float(mse_v),
-                            "reproj_cosine": float(cos_v),
-                            "perturbation_mode": args.perturbation_mode,
-                            "perturbation_level": float(args.perturbation_level),
-                            "perturbation_seed": int(args.perturbation_seed),
-                            "perturbation_paths": args.perturbation_paths,
-                            "perturbation_run_id": args.perturbation_run_id,
-                        }
+                cs_gt    = _clipscore(kept_paths, gt_caps)
+                cs_recon = _clipscore(kept_paths, caps_recon)
+                batch_rows = [
+                    {
+                        "sample_id": sid, "key": key,
+                        "folder_id": Path(path).parent.name if path else "",
+                        "model": args.embed_model,
+                        "image_path": path,
+                        "caption_recon": c1,
+                        "reproj_mse": float(mse_v),
+                        "reproj_cosine": float(cos_v),
+                        "clipscore_gt": float(cs_g),
+                        "clipscore_recon": float(cs_r),
+                        "clipscore_drop": float(cs_g - cs_r),
+                    }
+                    for sid, key, path, c1, mse_v, cos_v, cs_g, cs_r in zip(
+                        kept_sample_ids, kept_keys, kept_paths,
+                        caps_recon, mse_vals, cos_vals,
+                        cs_gt, cs_recon,
                     )
+                ]
+
+            df_batch = pd.DataFrame(batch_rows)
+            df_batch.to_csv(csv_file, index=False, header=write_header)
+            csv_file.flush()
+            write_header = False
+            done_keys.update(kept_keys)
 
             processed += len(kept_keys)
             if args.caption_limit > 0 and processed >= args.caption_limit:
                 break
 
-    if args.with_bertscore and args.compare_post_vs_recon and args.compare_only_two_paths:
-        print("[warn] --with_bertscore ignored in compare-only-two-paths mode")
+    csv_file.close()
+    print(f"done | processed={processed} missing_images={missing_images}")
+    print(f"saved: {out_csv}")
 
-    if args.with_bertscore and rows and not (args.compare_post_vs_recon and args.compare_only_two_paths):
+    if args.with_bertscore:
+        df_all = pd.read_csv(out_csv)
+        if "caption_recon" not in df_all.columns or "image_path" not in df_all.columns:
+            print("[warn] --with_bertscore: missing caption columns, skipping")
+            return
         from bert_score import score as bertscore_score
-
-        cands = [r["caption_recon"] for r in rows]
-        refs = [r["caption_original"] for r in rows]
+        cands = df_all["caption_recon"].fillna("").tolist()
+        refs = [
+            Path(p).with_suffix(".txt").read_text(encoding="utf-8").strip()
+            if Path(p).with_suffix(".txt").exists() else ""
+            for p in df_all["image_path"].fillna("").tolist()
+        ]
         p, r, f1 = bertscore_score(
-            cands=cands,
-            refs=refs,
+            cands=cands, refs=refs,
             lang=args.bertscore_lang,
             model_type=(args.bertscore_model_type or None),
             batch_size=args.bertscore_batch_size,
@@ -1048,30 +903,13 @@ def run_caption_compare(
         p_np = p.detach().cpu().numpy()
         r_np = r.detach().cpu().numpy()
         f1_np = f1.detach().cpu().numpy()
-        for i, row in enumerate(rows):
-            row["bertscore_precision"] = float(p_np[i])
-            row["bertscore_recall"] = float(r_np[i])
-            row["bertscore_f1"] = float(f1_np[i])
-        print(
-            f"bertscore summary | P={float(np.mean(p_np)):.4f} "
-            f"R={float(np.mean(r_np)):.4f} F1={float(np.mean(f1_np)):.4f}"
-        )
-
-    os.makedirs(args.out_dir, exist_ok=True)
-    out_csv = os.path.join(args.out_dir, args.caption_csv_name)
-    df = pd.DataFrame(rows)
-    df.to_csv(out_csv, index=False)
-    print(f"done | rows={len(rows)} missing_images={missing_images}")
-    print(f"saved: {out_csv}")
-
-    if len(df) > 0:
-        print("reproj summary")
-        print(df[["reproj_mse", "reproj_cosine"]].describe())
+        df_all["bertscore_precision"] = p_np
+        df_all["bertscore_recall"] = r_np
+        df_all["bertscore_f1"] = f1_np
+        df_all.to_csv(out_csv, index=False)
+        print(f"bertscore summary | P={float(np.mean(p_np)):.4f} R={float(np.mean(r_np)):.4f} F1={float(np.mean(f1_np)):.4f}")
 
 
-# -----------------------------
-# CLI
-# -----------------------------
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -1080,9 +918,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pre_dir", type=str, default="")
     parser.add_argument("--post_dir", type=str, default="")
     parser.add_argument("--image_dir", type=str, required=True)
+    parser.add_argument("--shards", type=str, default="",
+                        help="comma-separated shard folders to use, e.g. 00001,00002,00003. "
+                             "If set, vec_dir and image_dir are treated as parent dirs.")
+    parser.add_argument("--shard_limit", type=int, default=0,
+                        help="max samples to take from each shard (0=all)")
     parser.add_argument("--out_dir", type=str, default="./caption_compare_out")
-
-    parser.add_argument("--embed_model", type=str, default="llava", choices=["llava", "idefics2", "qwen2.5vl"])
+    
+    parser.add_argument("--embed_model", type=str, default="llava", choices=["llava", "idefics2", "qwen2.5vl", "qwen3.5"])
     parser.add_argument("--model_type", type=str, default="mlp", choices=["mlp", "transformer"])
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--num_heads", type=int, default=16)
@@ -1110,27 +953,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare_only_two_paths", action="store_true")
 
     parser.add_argument("--caption_prompt", type=str, default="Describe this image in one detailed sentence, focusing on the main objects, attributes, and scene.")
-    parser.add_argument("--caption_max_new_tokens", type=int, default=128)
+    parser.add_argument("--caption_max_new_tokens", type=int, default=256)
     parser.add_argument("--caption_csv_name", type=str, default="caption_original_vs_recon.csv")
     parser.add_argument("--caption_limit", type=int, default=0)
     parser.add_argument("--img_size", type=int, default=336)
 
-    parser.add_argument(
-        "--perturbation_mode",
-        type=str,
-        default="none",
-        choices=["none", "mask", "lowrank", "orthogonal"],
-    )
-    parser.add_argument("--perturbation_level", type=float, default=0.5)
-    parser.add_argument("--perturbation_seed", type=int, default=1337)
-    parser.add_argument(
-        "--perturbation_paths",
-        type=str,
-        default="all",
-        choices=["all", "post_direct", "recon"],
-    )
-    parser.add_argument("--perturbation_run_id", type=str, default="")
-    
+    parser.add_argument("--clip_model_id", type=str, default="openai/clip-vit-base-patch16",
+                        help="CLIP model for inline CLIPScore computation")
     parser.add_argument("--with_bertscore", action="store_true")
     parser.add_argument("--bertscore_lang", type=str, default="en")
     parser.add_argument("--bertscore_model_type", type=str, default="")
@@ -1150,16 +979,6 @@ def main() -> None:
     if not args.model_dir:
         args.model_dir = args.out_dir
 
-    if args.perturbation_mode == "none" and args.perturbation_paths != "all":
-        print("[warn] --perturbation_paths has no effect when --perturbation_mode=none")
-
-    if args.perturbation_mode != "none":
-        print(
-            "[info] perturbation enabled | "
-            f"mode={args.perturbation_mode} level={args.perturbation_level} "
-            f"paths={args.perturbation_paths} seed={args.perturbation_seed}"
-        )
-
     os.makedirs(args.out_dir, exist_ok=True)
 
     random.seed(args.seed)
@@ -1168,15 +987,36 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = ShardPairVectorDataset(
-        vec_dir=args.vec_dir or None,
-        pre_dir=args.pre_dir or None,
-        post_dir=args.post_dir or None,
-        limit=args.limit,
-        cache_shards=args.cache_shards,
-        cache_fp32=args.cache_fp32,
-        strip_cls=not args.no_strip_cls,
-    )
+    if args.shards:
+        shard_names = [s.strip() for s in args.shards.split(",") if s.strip()]
+        datasets = []
+        for shard in shard_names:
+            vec_dir = os.path.join(args.vec_dir, shard) if args.vec_dir else None
+            pre_dir = os.path.join(args.pre_dir, shard) if args.pre_dir else None
+            post_dir = os.path.join(args.post_dir, shard) if args.post_dir else None
+            datasets.append(ShardPairVectorDataset(
+                vec_dir=vec_dir,
+                pre_dir=pre_dir,
+                post_dir=post_dir,
+                limit=args.shard_limit,
+                cache_shards=args.cache_shards,
+                cache_fp32=args.cache_fp32,
+                strip_cls=not args.no_strip_cls,
+            ))
+        dataset = torch.utils.data.ConcatDataset(datasets)
+        # build a merged image index from all shard image dirs
+        args.image_dir = args.image_dir  # keep as parent; build_image_index recurses
+    else:
+        dataset = ShardPairVectorDataset(
+            vec_dir=args.vec_dir or None,
+            pre_dir=args.pre_dir or None,
+            post_dir=args.post_dir or None,
+            limit=args.limit,
+            cache_shards=args.cache_shards,
+            cache_fp32=args.cache_fp32,
+            strip_cls=not args.no_strip_cls,
+        )
+
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -1185,10 +1025,24 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    recon_model = build_model(args, device)
     model_path = resolve_model_path(args)
     print("loading reconstruction model from", model_path)
-    recon_model.load_state_dict(load_state_dict(model_path), strict=True)
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(ckpt, dict) and "meta" in ckpt:
+        meta = ckpt["meta"]
+        args.model_type  = meta.get("model_type",  args.model_type)
+        args.hidden_size = meta.get("hidden_size",  args.hidden_size)
+        args.num_layers  = meta.get("num_layers",   args.num_layers)
+        args.num_heads   = meta.get("num_heads",    args.num_heads)
+        args.seq_length  = meta.get("seq_length",   args.seq_length)
+        if meta.get("normalize", False):
+            args.normalize_recon_input = True
+        print(f"[meta] model_type={args.model_type} hidden={args.hidden_size} "
+              f"layers={args.num_layers} heads={args.num_heads}")
+    recon_model = build_model(args, device)
+    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt \
+        else {k.replace("module.", ""): v for k, v in ckpt.items()}
+    recon_model.load_state_dict(state_dict, strict=True)
     recon_model.eval()
 
     run_caption_compare(recon_model, loader, args, device)

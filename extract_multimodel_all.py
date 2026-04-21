@@ -189,7 +189,11 @@ def _build_inputs_llava(processor, images: List[Image.Image], prompt: str, img_s
 
 def _build_inputs_idefics2(processor, images: List[Image.Image], prompt: str, img_size: int, device: str):
     images = _resize_images(images, img_size)
-    prompts = [prompt + "<image>" for _ in images]
+    messages = [
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}
+    ]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    prompts = [text] * len(images)
     inputs = processor(text=prompts, images=[[im] for im in images], padding=True, return_tensors="pt")
     return {k: v.to(device) for k, v in inputs.items()}
 
