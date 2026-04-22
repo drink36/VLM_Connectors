@@ -11,29 +11,45 @@ connector-only replacement ill-defined.
 Training uses saved pre_vectors_*.pt shards + captions. The frozen LLM
 provides CE loss; no vision encoder is needed at train time.
 
+Data loading:
+  --vec_dir points to the parent model dir (e.g. data/vector/llava).
+  --shard_folders lists which subfolders to use (e.g. 00000,00001,...,00005).
+  --limit_per_shard / --val_per_shard control how many samples per shard go to
+  train vs val (non-overlapping slices: train = [0, limit), val = [limit, limit+val)).
+
 Usage:
-  # LLaVA invertible connector (smoke test)
+  # smoke test (1 shard, 100 train + 20 val, 2 epochs)
   python train_connector.py \
       --embed_model llava \
       --connector_type invertible \
-      --vec_dir data/vector/llava/00000 \
-      --limit 500 --epochs 2 --batch_size 4 --amp \
-      --out_dir train_connector_out/llava_inv_test
+      --vec_dir data/vector/llava \
+      --shard_folders 00000 \
+      --limit_per_shard 100 --val_per_shard 20 \
+      --epochs 2 --batch_size 4 --amp \
+      --out_dir train_connector_out/test
 
-  # Idefics2 cross-attention connector
+  # full run (6 shards x 500 train + 200 val = 3000 train / 1200 val)
   python train_connector.py \
-      --embed_model idefics2 \
-      --connector_type crossattn \
-      --vec_dir data/vector/idefics2/00000 \
-      --epochs 10 --batch_size 4 --amp \
-      --out_dir train_connector_out/idefics2_ca \
-      --export_post_vectors \
-      --export_dir data/new_post/idefics2_ca/00000
+      --embed_model llava \
+      --connector_type invertible \
+      --vec_dir data/vector/llava \
+      --shard_folders 00000,00001,00002,00003,00004,00005 \
+      --limit_per_shard 500 --val_per_shard 200 \
+      --gt_caption_dir data/mtf2025_web_images \
+      --epochs 10 --batch_size 4 --accumulation_steps 4 --amp \
+      --wandb --wandb_project vlm-connectors \
+      --out_dir train_connector_out/llava_invertible \
+      --export_post_vectors --export_dir data/new_post/llava_invertible
 """
 import argparse
 import math
 import re
 import random
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
@@ -207,54 +223,77 @@ def _numeric_suffix(p: Path) -> int:
 class ConnectorTrainDataset(Dataset):
     """Loads pre_vectors_*.pt shards + captions. Optionally loads post vecs for geo reg.
 
+    vec_dirs: list of shard directories (e.g. [data/vector/llava/00000, .../00001, ...]).
+    limit_per_shard: max samples taken from each dir (0 = all).
     If gt_caption_dir is given, captions are loaded from <gt_caption_dir>/<key>.txt
     instead of the shard's own 'caps' field. Samples missing a GT file are skipped.
     """
 
-    def __init__(self, vec_dir: str, limit: int = 0,
+    def __init__(self, vec_dirs: list, limit_per_shard: int = 0,
+                 offset_per_shard: int = 0,
                  cache_shards: int = 2, load_post: bool = False,
                  gt_caption_dir: Optional[str] = None):
-        root = Path(vec_dir)
-        self.pre_files = sorted(root.glob("pre_vectors_*.pt"), key=_numeric_suffix)
-        self.post_files = sorted(root.glob("post_vectors_*.pt"), key=_numeric_suffix) if load_post else []
-        if not self.pre_files:
-            raise FileNotFoundError(f"No pre_vectors_*.pt found in {vec_dir}")
-
         self.load_post = load_post
         self.cache_shards = max(1, cache_shards)
         self.gt_dir = Path(gt_caption_dir) if gt_caption_dir else None
 
-        pre_map = {_numeric_suffix(p): p for p in self.pre_files}
-        post_map = {_numeric_suffix(p): p for p in self.post_files} if load_post else {}
-        tags = sorted(pre_map.keys())
-        if load_post:
-            tags = sorted(set(tags) & set(post_map.keys()))
-
-        self.pre_map = pre_map
-        self.post_map = post_map
-
+        self.pre_map: dict[int, Path] = {}
+        self.post_map: dict[int, Path] = {}
+        self.shard_gt_map: dict[int, Optional[Path]] = {}  # unique_tag -> shard gt dir
         self.items: list[tuple[int, int, str]] = []
+
+        global_tag = 0
         skipped = 0
-        seen = 0
-        for tag in tags:
-            obj = torch.load(pre_map[tag], map_location="cpu", weights_only=False)
-            for row_idx, key in enumerate(obj["keys"]):
-                key = str(key)
-                if self.gt_dir is not None:
-                    gt_path = self.gt_dir / f"{key}.txt"
-                    if not gt_path.exists():
-                        skipped += 1
+        for vec_dir in vec_dirs:
+            root = Path(vec_dir)
+            shard_name = root.name  # e.g. "00000"
+            pre_files = sorted(root.glob("pre_vectors_*.pt"), key=_numeric_suffix)
+            post_files = sorted(root.glob("post_vectors_*.pt"), key=_numeric_suffix) if load_post else []
+            if not pre_files:
+                print(f"[dataset] WARNING: no pre_vectors_*.pt in {vec_dir}, skipping")
+                continue
+
+            # GT captions live at gt_dir/<shard>/<key>.txt
+            shard_gt_dir = (self.gt_dir / shard_name) if self.gt_dir is not None else None
+
+            pre_map_local = {_numeric_suffix(p): p for p in pre_files}
+            post_map_local = {_numeric_suffix(p): p for p in post_files} if load_post else {}
+            tags = sorted(pre_map_local.keys())
+            if load_post:
+                tags = sorted(set(tags) & set(post_map_local.keys()))
+
+            seen_this_dir = 0
+            for local_tag in tags:
+                unique_tag = global_tag
+                global_tag += 1
+                self.pre_map[unique_tag] = pre_map_local[local_tag]
+                self.shard_gt_map[unique_tag] = shard_gt_dir
+                if load_post:
+                    self.post_map[unique_tag] = post_map_local[local_tag]
+
+                obj = torch.load(pre_map_local[local_tag], map_location="cpu", weights_only=False)
+                skipped_offset = 0
+                for row_idx, key in enumerate(obj["keys"]):
+                    key = str(key)
+                    if shard_gt_dir is not None:
+                        gt_path = shard_gt_dir / f"{key}.txt"
+                        if not gt_path.exists():
+                            skipped += 1
+                            continue
+                    if skipped_offset < offset_per_shard:
+                        skipped_offset += 1
                         continue
-                self.items.append((tag, row_idx, key))
-                seen += 1
-                if limit and seen >= limit:
+                    self.items.append((unique_tag, row_idx, key))
+                    seen_this_dir += 1
+                    if limit_per_shard and seen_this_dir >= limit_per_shard:
+                        break
+                if limit_per_shard and seen_this_dir >= limit_per_shard:
                     break
-            if limit and seen >= limit:
-                break
 
         if skipped:
             print(f"[dataset] skipped {skipped} samples with no GT caption file")
-        print(f"[dataset] {len(self.items)} samples from {vec_dir}"
+        dirs_str = ", ".join(str(Path(d).name) for d in vec_dirs)
+        print(f"[dataset] {len(self.items)} samples from [{dirs_str}]"
               + (" (GT captions)" if self.gt_dir else " (shard captions)"))
 
         self.pre_cache: OrderedDict = OrderedDict()
@@ -283,8 +322,9 @@ class ConnectorTrainDataset(Dataset):
             self.post_cache[tag] = post_obj["vecs"].float()
 
     def _get_cap(self, tag: int, row: int, key: str) -> str:
-        if self.gt_dir is not None:
-            return (self.gt_dir / f"{key}.txt").read_text(encoding="utf-8").strip()
+        shard_gt = self.shard_gt_map.get(tag)
+        if shard_gt is not None:
+            return (shard_gt / f"{key}.txt").read_text(encoding="utf-8").strip()
         return self.cap_cache[tag][row]
 
     def __getitem__(self, idx: int) -> dict:
@@ -450,7 +490,7 @@ def forward_with_injection(vlm, connector, pre: torch.Tensor,
             # Hook replaces multi_modal_projector output with new_E_post
             _injected = [None]
 
-            def _hook(module, inp, output):
+            def _hook(_module, _inp, output):
                 _injected[0] = reshape_like(new_E_post, output).to(dtype=output.dtype)
                 return _injected[0]
 
@@ -486,17 +526,32 @@ def train(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # wandb
+    use_wandb = args.wandb and _WANDB_AVAILABLE
+    if args.wandb and not _WANDB_AVAILABLE:
+        print("WARNING: wandb not installed, skipping logging")
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or f"{args.embed_model}_{args.connector_type}",
+            config=vars(args),
+        )
+
     # Dataset
     load_post = args.geo_reg_weight > 0
-    ds = ConnectorTrainDataset(args.vec_dir, limit=args.limit,
-                               cache_shards=args.cache_shards, load_post=load_post,
-                               gt_caption_dir=args.gt_caption_dir or None)
-    n_val = max(1, int(len(ds) * (1 - args.train_split)))
-    n_train = len(ds) - n_val
-    train_ds, val_ds = torch.utils.data.random_split(
-        ds, [n_train, n_val],
-        generator=torch.Generator().manual_seed(args.seed)
-    )
+    if args.shard_folders:
+        base = Path(args.vec_dir)
+        vec_dirs = [str(base / s.strip()) for s in args.shard_folders.split(",")]
+    else:
+        vec_dirs = [args.vec_dir]
+    train_ds = ConnectorTrainDataset(vec_dirs, limit_per_shard=args.limit_per_shard,
+                                     offset_per_shard=0,
+                                     cache_shards=args.cache_shards, load_post=load_post,
+                                     gt_caption_dir=args.gt_caption_dir or None)
+    val_ds = ConnectorTrainDataset(vec_dirs, limit_per_shard=args.val_per_shard,
+                                   offset_per_shard=args.limit_per_shard,
+                                   cache_shards=args.cache_shards, load_post=load_post,
+                                   gt_caption_dir=args.gt_caption_dir or None)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate_fn, num_workers=args.num_workers,
                               pin_memory=(device.type == "cuda"))
@@ -567,6 +622,10 @@ def train(args):
 
             train_loss += loss.item() * args.accumulation_steps
             pbar.set_postfix(loss=f"{train_loss / (step + 1):.4f}")
+            if use_wandb and (step + 1) % args.accumulation_steps == 0:
+                global_step = epoch * len(train_loader) + step + 1
+                wandb.log({"train/loss": loss.item() * args.accumulation_steps,
+                           "train/lr": scheduler.get_last_lr()[0]}, step=global_step)
 
         # --- Validate ---
         connector.eval()
@@ -580,7 +639,11 @@ def train(args):
                     vlm, connector, pre, inputs, args.embed_model, use_amp, amp_dtype)
                 val_loss += ce_loss.item()
         val_loss /= max(1, len(val_loader))
+        train_epoch_loss = train_loss / max(1, len(train_loader))
         print(f"  val_loss={val_loss:.4f}")
+        if use_wandb:
+            wandb.log({"epoch/train_loss": train_epoch_loss,
+                       "epoch/val_loss": val_loss}, step=(epoch + 1) * len(train_loader))
 
         if val_loss < best_val_loss - 1e-4:
             best_val_loss = val_loss
@@ -590,6 +653,9 @@ def train(args):
                         "val_loss": val_loss},
                        out_dir / "best_connector.pt")
             print(f"  -> saved best (val_loss={val_loss:.4f})")
+            if use_wandb:
+                wandb.summary["best_val_loss"] = best_val_loss
+                wandb.summary["best_epoch"] = epoch + 1
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
@@ -597,12 +663,17 @@ def train(args):
                 break
 
     print(f"Training done. Best val_loss={best_val_loss:.4f}")
+    if use_wandb:
+        wandb.finish()
 
     if args.export_post_vectors:
         ckpt = torch.load(out_dir / "best_connector.pt", map_location="cpu", weights_only=False)
         connector.load_state_dict(ckpt["state_dict"])
-        export_new_post_vectors(connector, args.vec_dir, args.export_dir or str(out_dir / "new_post"),
-                                device, args.batch_size)
+        for vd in vec_dirs:
+            shard_name = Path(vd).name
+            export_dir = args.export_dir or str(out_dir / "new_post")
+            export_new_post_vectors(connector, vd, str(Path(export_dir) / shard_name),
+                                    device, args.batch_size)
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +727,11 @@ def parse_args():
     p.add_argument("--embed_model", type=str, required=True, choices=["llava", "idefics2"])
     p.add_argument("--connector_type", type=str, required=True, choices=["invertible", "crossattn"])
     p.add_argument("--vec_dir", type=str, required=True,
-                   help="directory containing pre_vectors_*.pt shards")
+                   help="shard dir (single) or parent dir (with --shard_folders)")
+    p.add_argument("--shard_folders", type=str, default="",
+                   help="comma-separated shard subfolder names, e.g. 00000,00001,00002,00003,00004,00005")
+    p.add_argument("--limit_per_shard", type=int, default=500,
+                   help="max samples per shard folder (0 = all)")
     p.add_argument("--vlm_model_id", type=str, default="",
                    help="HuggingFace model id (default: model-family default)")
 
@@ -673,6 +748,8 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--warmup_steps", type=int, default=200)
     p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--val_per_shard", type=int, default=200,
+                   help="val samples taken per shard folder (from offset limit_per_shard)")
     p.add_argument("--accumulation_steps", type=int, default=4)
     p.add_argument("--geo_reg_weight", type=float, default=0.0,
                    help="weight for MSE geometry regularization against original E_post")
@@ -685,9 +762,17 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
 
     # Caption source
-    p.add_argument("--caption_prompt", type=str, default="What do you see in this image?")
+    p.add_argument("--caption_prompt", type=str, default="Describe this image in one detailed sentence, focusing on the main objects, attributes, and scene.")
     p.add_argument("--gt_caption_dir", type=str, default="",
                    help="directory with <key>.txt GT captions; if set, used instead of shard captions")
+    p.add_argument("--image_dir", type=str, default="",
+                   help="root image directory for CLIPScore and GT caption .txt lookup during inference")
+
+    # Logging
+    p.add_argument("--wandb", action="store_true", help="log to wandb")
+    p.add_argument("--wandb_project", type=str, default="vlm-connectors")
+    p.add_argument("--wandb_run_name", type=str, default="",
+                   help="run name (default: <embed_model>_<connector_type>)")
 
     # Output
     p.add_argument("--out_dir", type=str, default="train_connector_out")
@@ -695,8 +780,178 @@ def parse_args():
                    help="after training, export new post-vectors for knn.py analysis")
     p.add_argument("--export_dir", type=str, default="",
                    help="where to save exported post shards (default: out_dir/new_post)")
+
+    # Inference
+    p.add_argument("--infer", action="store_true",
+                   help="run caption inference with a trained connector (skip training)")
+    p.add_argument("--infer_checkpoint", type=str, default="",
+                   help="path to best_connector.pt (default: out_dir/best_connector.pt)")
+    p.add_argument("--infer_limit", type=int, default=100,
+                   help="number of samples to run inference on")
+    p.add_argument("--infer_out", type=str, default="",
+                   help="output CSV path (default: out_dir/infer_captions.csv)")
+    p.add_argument("--max_new_tokens", type=int, default=256)
     return p.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+
+def _resolve_proj_module(vlm):
+    mods = dict(vlm.named_modules())
+    return mods.get("multi_modal_projector") or mods.get("model.multi_modal_projector")
+
+
+def infer(args):
+    import csv
+    from PIL import Image as PILImage
+    from transformers import AutoProcessor as _AutoProcessor, CLIPModel
+    from transformers.image_utils import load_image
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    use_amp = args.amp and device.type == "cuda"
+
+    out_dir = Path(args.out_dir)
+    ckpt_path = args.infer_checkpoint or str(out_dir / "best_connector.pt")
+    out_csv = args.infer_out or str(out_dir / "infer_captions.csv")
+
+    print(f"Loading connector from {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    connector = build_connector(args).to(device).eval()
+    connector.load_state_dict(ckpt["state_dict"])
+
+    model_id = args.vlm_model_id or _default_model_id(args.embed_model)
+    print(f"Loading frozen VLM: {model_id}")
+    processor, vlm = load_vlm(args.embed_model, model_id, device, amp_dtype)
+
+    clip_model_id = "openai/clip-vit-base-patch16"
+    print(f"Loading CLIP: {clip_model_id}")
+    clip_proc = _AutoProcessor.from_pretrained(clip_model_id)
+    clip_mdl = CLIPModel.from_pretrained(clip_model_id, use_safetensors=True).to(device).eval()
+
+    key_to_path: dict[str, str] = {}
+    if args.image_dir:
+        exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+        for p in Path(args.image_dir).rglob("*"):
+            if p.suffix.lower() in exts:
+                key_to_path.setdefault(p.stem, str(p))
+
+    if args.shard_folders:
+        base = Path(args.vec_dir)
+        vec_dirs = [str(base / s.strip()) for s in args.shard_folders.split(",")]
+    else:
+        vec_dirs = [args.vec_dir]
+
+    ds = ConnectorTrainDataset(vec_dirs, limit_per_shard=args.infer_limit,
+                               offset_per_shard=0, cache_shards=args.cache_shards,
+                               load_post=False, gt_caption_dir=None)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+
+    proj_module = _resolve_proj_module(vlm) if args.embed_model == "llava" else None
+
+    @torch.no_grad()
+    def _clipscore(image_paths, captions):
+        scores = [float("nan")] * len(image_paths)
+        valid = [(i, p, c) for i, (p, c) in enumerate(zip(image_paths, captions))
+                 if p and Path(p).exists() and str(c).strip()]
+        if not valid:
+            return scores
+        idxs, paths, caps = zip(*valid)
+        images = [PILImage.open(p).convert("RGB") for p in paths]
+        inp = clip_proc(text=list(caps), images=images,
+                        padding=True, truncation=True, return_tensors="pt").to(device)
+        out = clip_mdl(**inp)
+        img_e = F.normalize(out.image_embeds, dim=-1)
+        txt_e = F.normalize(out.text_embeds, dim=-1)
+        vals = torch.clamp(100.0 * (img_e * txt_e).sum(dim=-1), min=0.0).cpu().tolist()
+        for i, v in zip(idxs, vals):
+            scores[i] = v
+        return scores
+
+    COLS = ["sample_id", "key", "folder_id", "model", "connector_type",
+            "image_path", "caption_connector", "clipscore_connector"]
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+
+    _template = [{"role": "user", "content": [{"type": "image"},
+                                               {"type": "text", "text": args.caption_prompt}]}]
+    _prompt_text = processor.apply_chat_template(_template, add_generation_prompt=True)
+
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=COLS)
+        writer.writeheader()
+
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="Inference"):
+                pre   = batch["pre"].to(device)
+                s_ids = batch["sample_id"]
+                keys  = [sid.split(":")[-1] if ":" in sid else sid for sid in s_ids]
+                image_paths = [key_to_path.get(k, "") for k in keys]
+
+                # Load real images per batch — exactly like caption_eval.py
+                images = [
+                    load_image(p) if p and Path(p).exists()
+                    else PILImage.new("RGB", (336, 336))
+                    for p in image_paths
+                ]
+                prompts = [_prompt_text] * len(images)
+                if args.embed_model == "llava":
+                    vlm_inputs = processor(images=images, text=prompts,
+                                           padding=True, return_tensors="pt")
+                else:  # idefics2
+                    vlm_inputs = processor(images=[[im] for im in images], text=prompts,
+                                           padding=True, return_tensors="pt")
+                vlm_inputs = {k: v.to(device) for k, v in vlm_inputs.items()}
+
+                new_e_post = connector(pre)
+
+                if args.embed_model == "llava":
+                    def _hook(_module, _inp, output):
+                        return reshape_like(new_e_post, output).to(dtype=output.dtype)
+                    h = proj_module.register_forward_hook(_hook)
+                    try:
+                        with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                            out_ids = vlm.generate(**vlm_inputs,
+                                                   max_new_tokens=args.max_new_tokens,
+                                                   do_sample=False)
+                    finally:
+                        h.remove()
+                else:  # idefics2
+                    idef_inputs = {k: v for k, v in vlm_inputs.items()
+                                   if k not in ("pixel_values", "pixel_attention_mask")}
+                    with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                        out_ids = vlm.generate(**idef_inputs,
+                                               image_hidden_states=new_e_post,
+                                               max_new_tokens=args.max_new_tokens,
+                                               do_sample=False)
+
+                prompt_len = vlm_inputs["input_ids"].shape[1]
+                caps_conn = processor.batch_decode(out_ids[:, prompt_len:],
+                                                   skip_special_tokens=True)
+                cs_conn = _clipscore(image_paths, caps_conn)
+
+                for sid, key, path, cap, cs in zip(s_ids, keys, image_paths, caps_conn, cs_conn):
+                    writer.writerow({
+                        "sample_id": sid,
+                        "key": key,
+                        "folder_id": Path(path).parent.name if path else "",
+                        "model": args.embed_model,
+                        "connector_type": args.connector_type,
+                        "image_path": path,
+                        "caption_connector": cap.strip(),
+                        "clipscore_connector": cs,
+                    })
+                total += len(s_ids)
+                f.flush()
+
+    print(f"Saved {total} rows -> {out_csv}")
+
+
 if __name__ == "__main__":
-    train(parse_args())
+    args = parse_args()
+    if args.infer:
+        infer(args)
+    else:
+        train(args)

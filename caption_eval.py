@@ -826,8 +826,6 @@ def run_caption_compare(
                         "image_path": path,
                         "caption_post_direct": c_post,
                         "caption_recon": c_recon,
-                        "reproj_mse_post_direct": float(mse_p),
-                        "reproj_cosine_post_direct": float(cos_p),
                         "reproj_mse_recon": float(mse_r),
                         "reproj_cosine_recon": float(cos_r),
                         "clipscore_gt": float(cs_g),
@@ -882,32 +880,50 @@ def run_caption_compare(
 
     if args.with_bertscore:
         df_all = pd.read_csv(out_csv)
-        if "caption_recon" not in df_all.columns or "image_path" not in df_all.columns:
+        post_col = "caption_post_direct" if "caption_post_direct" in df_all.columns else \
+                   "caption_original" if "caption_original" in df_all.columns else None
+        if post_col is None or "caption_recon" not in df_all.columns:
             print("[warn] --with_bertscore: missing caption columns, skipping")
             return
         from bert_score import score as bertscore_score
-        cands = df_all["caption_recon"].fillna("").tolist()
-        refs = [
+
+        def _bscore(hyps, refs):
+            valid = [(i, h, r) for i, (h, r) in enumerate(zip(hyps, refs)) if h.strip() and r.strip()]
+            f_out = [float("nan")] * len(hyps)
+            if not valid:
+                return f_out
+            idxs, hs, rs = zip(*valid)
+            _, _, f1 = bertscore_score(
+                list(hs), list(rs),
+                lang=args.bertscore_lang,
+                model_type=(args.bertscore_model_type or None),
+                batch_size=args.bertscore_batch_size,
+                rescale_with_baseline=args.bertscore_rescale,
+                verbose=False,
+            )
+            for i, v in zip(idxs, f1.tolist()):
+                f_out[i] = v
+            return f_out
+
+        caps_post  = df_all[post_col].fillna("").astype(str).tolist()
+        caps_recon = df_all["caption_recon"].fillna("").astype(str).tolist()
+        gt_caps = [
             Path(p).with_suffix(".txt").read_text(encoding="utf-8").strip()
             if Path(p).with_suffix(".txt").exists() else ""
-            for p in df_all["image_path"].fillna("").tolist()
+            for p in df_all["image_path"].fillna("").astype(str).tolist()
         ]
-        p, r, f1 = bertscore_score(
-            cands=cands, refs=refs,
-            lang=args.bertscore_lang,
-            model_type=(args.bertscore_model_type or None),
-            batch_size=args.bertscore_batch_size,
-            rescale_with_baseline=args.bertscore_rescale,
-            verbose=True,
-        )
-        p_np = p.detach().cpu().numpy()
-        r_np = r.detach().cpu().numpy()
-        f1_np = f1.detach().cpu().numpy()
-        df_all["bertscore_precision"] = p_np
-        df_all["bertscore_recall"] = r_np
-        df_all["bertscore_f1"] = f1_np
+
+        print("BERTScore: recon vs post ...")
+        df_all["bertscore_recon_vs_post_f1"] = _bscore(caps_recon, caps_post)
+        print("BERTScore: post vs GT ...")
+        df_all["bertscore_post_vs_gt_f1"]    = _bscore(caps_post, gt_caps)
+        print("BERTScore: recon vs GT ...")
+        df_all["bertscore_recon_vs_gt_f1"]   = _bscore(caps_recon, gt_caps)
+
         df_all.to_csv(out_csv, index=False)
-        print(f"bertscore summary | P={float(np.mean(p_np)):.4f} R={float(np.mean(r_np)):.4f} F1={float(np.mean(f1_np)):.4f}")
+        print(f"bertscore_recon_vs_post F1 : {np.nanmean(df_all['bertscore_recon_vs_post_f1']):.4f}")
+        print(f"bertscore_post_vs_gt    F1 : {np.nanmean(df_all['bertscore_post_vs_gt_f1']):.4f}")
+        print(f"bertscore_recon_vs_gt   F1 : {np.nanmean(df_all['bertscore_recon_vs_gt_f1']):.4f}")
 
 
 

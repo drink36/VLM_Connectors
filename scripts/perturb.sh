@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --account=PAS3272
 #SBATCH --job-name=perturb-eval
-#SBATCH --time=30:00:00
-#SBATCH --cluster=pitzer
+#SBATCH --time=6:00:00
+#SBATCH --cluster=ascend
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
@@ -19,5 +19,5 @@ python perturb_eval.py \
     --model_name ${MODEL} \
     --mode ${MODE} \
     --level ${LEVEL} \
-    --out_dir ./perturb_out \
+    --out_dir ./perturb_out_a \
     --amp --limit 5000

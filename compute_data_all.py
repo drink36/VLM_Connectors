@@ -578,86 +578,175 @@ def plot_triway_knor_lines(
     _save_fig(fig, save_path)
 
 
-if __name__ == "__main__":
-    # Example usage:
-    base = "data/output/knn_out_clip"
-    save_base = "figures/knn_clip"
-    model_json_map = {
-        "LLaVA": f"{base}/llava_00000/overlap_top100_l2_torch.json",
-        "Idefics2": f"{base}/idefics2_00000/overlap_top100_l2_torch.json",
-        "Qwen-2.5-VL": f"{base}/qwen2.5vl_00000/overlap_top100_l2_torch.json",
-        "Qwen-3.5": f"{base}/qwen3.5_00000/overlap_top100_l2_torch.json",
+def aggregate_jsons(json_paths: list[str]) -> dict:
+    """Average all numeric mean/std fields across multiple per-shard JSONs, including global spectrum."""
+    from collections import defaultdict
+    accum = defaultdict(list)
+    spec_pre_sv, spec_pre_en = [], []
+    spec_post_sv, spec_post_en = [], []
+    spec_scalar_pre, spec_scalar_post = defaultdict(list), defaultdict(list)
+
+    for p in json_paths:
+        d = load_json(p)
+        for key, val in d.items():
+            if key == "global":
+                sr = val.get("spectrum_and_rank", {})
+                pre = sr.get("pre_summary", {})
+                post = sr.get("post_summary", {})
+                if pre.get("mean_singular_values_topn"):
+                    spec_pre_sv.append(pre["mean_singular_values_topn"])
+                if pre.get("mean_energy_spectrum_topn"):
+                    spec_pre_en.append(pre["mean_energy_spectrum_topn"])
+                if post.get("mean_singular_values_topn"):
+                    spec_post_sv.append(post["mean_singular_values_topn"])
+                if post.get("mean_energy_spectrum_topn"):
+                    spec_post_en.append(post["mean_energy_spectrum_topn"])
+                for k, v in pre.items():
+                    if isinstance(v, (int, float)):
+                        spec_scalar_pre[k].append(v)
+                for k, v in post.items():
+                    if isinstance(v, (int, float)):
+                        spec_scalar_post[k].append(v)
+                continue
+            if isinstance(val, dict) and "mean" in val:
+                accum[key].append(val["mean"])
+
+    result = {key: {"mean": float(np.mean(vals)), "std": float(np.std(vals))}
+              for key, vals in accum.items()}
+
+    pre_summary = {k: float(np.mean(v)) for k, v in spec_scalar_pre.items()}
+    post_summary = {k: float(np.mean(v)) for k, v in spec_scalar_post.items()}
+    if spec_pre_sv:
+        pre_summary["mean_singular_values_topn"] = np.mean(spec_pre_sv, axis=0).tolist()
+    if spec_pre_en:
+        pre_summary["mean_energy_spectrum_topn"] = np.mean(spec_pre_en, axis=0).tolist()
+    if spec_post_sv:
+        post_summary["mean_singular_values_topn"] = np.mean(spec_post_sv, axis=0).tolist()
+    if spec_post_en:
+        post_summary["mean_energy_spectrum_topn"] = np.mean(spec_post_en, axis=0).tolist()
+
+    cos_scalar_pre, cos_scalar_post = defaultdict(list), defaultdict(list)
+    cos_scalar_top = defaultdict(list)
+    for p in json_paths:
+        d = load_json(p)
+        cc = d.get("global", {}).get("cosine_concentration", {})
+        for k, v in cc.get("pre_summary", {}).items():
+            if isinstance(v, (int, float)):
+                cos_scalar_pre[k].append(v)
+        for k, v in cc.get("post_summary", {}).items():
+            if isinstance(v, (int, float)):
+                cos_scalar_post[k].append(v)
+        for k, v in cc.items():
+            if isinstance(v, (int, float)):
+                cos_scalar_top[k].append(v)
+
+    cosine_concentration = {
+        "pre_summary":  {k: float(np.mean(v)) for k, v in cos_scalar_pre.items()},
+        "post_summary": {k: float(np.mean(v)) for k, v in cos_scalar_post.items()},
+        **{k: float(np.mean(v)) for k, v in cos_scalar_top.items()},
     }
+
+    result["global"] = {
+        "spectrum_and_rank": {"pre_summary": pre_summary, "post_summary": post_summary},
+        "cosine_concentration": cosine_concentration,
+    }
+    return result
+
+
+def build_model_json_map(base: str, models: dict[str, str], json_name: str) -> dict:
+    """
+    For each model, aggregate all available shard JSONs under base/<model_dir>/<shard>/.
+    models: {"DisplayName": "dir_name", ...}
+    Returns {"DisplayName": aggregated_dict_or_path, ...} — but since plotting functions
+    expect file paths, we write a temp JSON and return its path.
+    """
+    import tempfile, os
+    result = {}
+    for display, dirname in models.items():
+        model_dir = Path(base) / dirname
+        if not model_dir.exists():
+            print(f"  [warn] missing: {model_dir}")
+            continue
+        shard_jsons = sorted(model_dir.glob(f"*/{json_name}"))
+        if not shard_jsons:
+            print(f"  [warn] no JSONs found under {model_dir}")
+            continue
+        print(f"  {display}: aggregating {len(shard_jsons)} shards")
+        agg = aggregate_jsons([str(p) for p in shard_jsons])
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        import json as _json
+        _json.dump(agg, tmp)
+        tmp.close()
+        result[display] = tmp.name
+    return result
+
+
+if __name__ == "__main__":
+    base = "data/output/knn_out"
+    save_base = "figures/knn"
+    json_name = "overlap_top100_l2_torch.json"
+
+    MODELS = {
+        "LLaVA":      "llava",
+        "Idefics2":   "idefics2",
+        "Qwen-2.5-VL": "qwen2.5vl",
+        "Qwen-3.5":   "qwen3.5",
+    }
+
+    print("Aggregating all shards ...")
+    model_json_map = build_model_json_map(base, MODELS, json_name)
     plot_single_dataset_topk_full(
         model_json_map,
-        title="mtf2025/0000",
-        save_path=f"{save_base}/single_dataset_topk_mtf2025_0000.png",
+        title="mtf2025 (all shards)",
+        save_path=f"{save_base}/single_dataset_topk_all.png",
     )
     plot_single_dataset_topk_with_ref(
         model_json_map,
         ref="clip",
-        title="mtf2025/0000 — KNOR with CLIP reference",
+        title="mtf2025 (all shards) — KNOR with CLIP reference",
         save_path=f"{save_base}/single_dataset_topk_with_clip.png",
     )
-    for model_name, json_path in model_json_map.items():
-        plot_pre_post_singular_spectrum(
-            json_path,
-            save_path=f"{save_base}/singular_spectrum_{model_name.lower().replace('-', '').replace('.', '')}.png",
-            topn=100,
-            log_scale=True,
-            title=f"{model_name} Singular Value Spectrum",
-        )
-        plot_pre_post_energy_spectrum(
-            json_path,
-            save_path=f"{save_base}/energy_spectrum_{model_name.lower().replace('-', '').replace('.', '')}.png",
-            topn=100,
-            log_scale=True,
-            title=f"{model_name} Energy Spectrum",
-        )
-        plot_pre_post_summary_bars(
-            json_path,
-            save_path=f"{save_base}/pre_post_summary_bars_{model_name.lower().replace('-', '').replace('.', '')}.png",
-            title=f"{model_name} Pre/Post Summary",
-        )
-    # -----------------------------------------------------------------------
-    # N-way KNOR: run knn.py with --ref_pt (CLIP) and --ref_pt2 (DINOv2) to
-    # populate {label}_pre/post entries in each JSON, then call these.
-    # -----------------------------------------------------------------------
-    # Step 1a — extract CLIP reference embeddings:
-    #   python extract_clip_ref.py \
-    #       --root data/mtf2025_web_images \
-    #       --out_dir data/clip_ref \
-    #       --model_id openai/clip-vit-large-patch14-336 \
-    #       --pool cls --device cuda
-    #
-    # Step 1b — extract DINOv2 reference embeddings:
-    #   python extract_clip_ref.py \
-    #       --root data/mtf2025_web_images \
-    #       --out_dir data/dino_ref \
-    #       --model_id facebook/dinov2-large \
-    #       --pool cls --device cuda
-    #
-    # Step 2 — re-run knn.py for each model with both refs:
-    #   python knn.py \
-    #       --pre_pt data/vector/llava/0000 \
-    #       --post_pt data/vector/llava/0000 \
-    #       --ref_pt  data/clip_ref/0000 --ref_label clip \
-    #       --ref_pt2 data/dino_ref/0000 --ref2_label dino \
-    #       --out_dir knn_out_llava \
-    #       --pool mean --metric l2
-    #   (repeat for idefics2, qwen2.5vl, qwen3.5)
-    #
-    # Step 3 — plot with both refs:
+    plot_single_dataset_topk_with_ref(
+        model_json_map,
+        ref="dino",
+        title="mtf2025 (all shards) — KNOR with DINOv2 reference",
+        save_path=f"{save_base}/single_dataset_topk_with_dino.png",
+    )
+    plot_single_dataset_topk_with_ref(
+        model_json_map,
+        ref="dinov3",
+        title="mtf2025 (all shards) — KNOR with DINOv3 reference",
+        save_path=f"{save_base}/single_dataset_topk_with_dinov3.png",
+    )
     plot_triway_knor_bars(
         model_json_map,
         k=100,
-        refs=("clip", "dino"),
-        title="KNOR (k=100): CLIP & DINOv3 ref vs pre/post-connector",
+        refs=("clip", "dino", "dinov3"),
+        title="KNOR (k=100): CLIP / DINOv2 / DINOv3 ref vs pre/post-connector",
         save_path=f"{save_base}/triway_knor_bars_k100.png",
     )
     plot_triway_knor_lines(
         model_json_map,
-        refs=("clip", "dino"),
-        title="KNOR across k: CLIP & DINOv3 ref",
+        refs=("clip", "dino", "dinov3"),
+        title="KNOR across k: CLIP / DINOv2 / DINOv3 ref",
         save_path=f"{save_base}/triway_knor_lines.png",
     )
+    for model_name, json_path in model_json_map.items():
+        slug = model_name.lower().replace("-", "").replace(".", "")
+        plot_pre_post_singular_spectrum(
+            json_path,
+            save_path=f"{save_base}/singular_spectrum_{slug}.png",
+            topn=100, log_scale=True,
+            title=f"{model_name} Singular Value Spectrum",
+        )
+        plot_pre_post_energy_spectrum(
+            json_path,
+            save_path=f"{save_base}/energy_spectrum_{slug}.png",
+            topn=100, log_scale=True,
+            title=f"{model_name} Energy Spectrum",
+        )
+        plot_pre_post_summary_bars(
+            json_path,
+            save_path=f"{save_base}/pre_post_summary_bars_{slug}.png",
+            title=f"{model_name} Pre/Post Summary",
+        )
