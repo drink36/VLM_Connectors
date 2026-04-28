@@ -24,6 +24,7 @@ DEFAULT_COLS = [
     "reproj_cosine_recon",
     "reproj_mse_recon",
     "bertscore_recon_vs_post_f1",
+    "bertscore_drop",
 ]
 
 
@@ -40,6 +41,8 @@ def load_model(data_dir: Path, model: str) -> pd.DataFrame | None:
             "bertscore_precision": "bertscore_recon_vs_post_precision",
             "bertscore_recall":    "bertscore_recon_vs_post_recall",
         })
+    if "bertscore_post_vs_gt_f1" in df.columns and "bertscore_recon_vs_gt_f1" in df.columns:
+        df["bertscore_drop"] = df["bertscore_post_vs_gt_f1"] - df["bertscore_recon_vs_gt_f1"]
     return df
 
 

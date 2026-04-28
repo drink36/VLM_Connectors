@@ -30,6 +30,12 @@ def load_all():
         p = DATA_DIR / m / "caption_original_vs_recon.csv"
         df = pd.read_csv(p)
         df["model"] = m
+        if "bertscore_recon_vs_post_f1" not in df.columns and "bertscore_f1" in df.columns:
+            df = df.rename(columns={"bertscore_f1": "bertscore_recon_vs_post_f1"})
+        if "bertscore_post_vs_gt_f1" in df.columns and "bertscore_recon_vs_gt_f1" in df.columns:
+            df["bertscore_drop"] = df["bertscore_post_vs_gt_f1"] - df["bertscore_recon_vs_gt_f1"]
+        else:
+            df["bertscore_drop"] = float("nan")
         dfs.append(df)
     return pd.concat(dfs, ignore_index=True)
 
@@ -183,7 +189,66 @@ def fig8(df):
     ax.set_title("Fig 8 — Cosine vs BERTScore")
     ax.legend(markerscale=3)
     add_scale_lines(ax)
-    save(fig, "fig08_cosine_vs_bertscore")
+    for name in ["fig08_cosine_vs_bertscore", "fig08_cosine_vs_bert"]:
+        path = OUT_DIR / f"{name}.png"
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"  saved {path}")
+    plt.close(fig)
+
+
+def fig9(df):
+    """BERTScore drop violin per model (NaN = no GT ref, e.g. qwen3.5)."""
+    fig, ax = plt.subplots(figsize=(7, 5))
+    data, positions = [], []
+    for i, m in enumerate(MODELS):
+        vals = df[df["model"] == m]["bertscore_drop"].dropna().values
+        if len(vals) > 0:
+            data.append(vals)
+            positions.append(i)
+    if data:
+        parts = ax.violinplot(data, positions=positions, showmedians=True)
+        for pc, pos in zip(parts["bodies"], positions):
+            pc.set_facecolor(MODEL_COLORS[MODELS[pos]])
+            pc.set_alpha(0.7)
+    ax.set_xticks(range(len(MODELS)))
+    ax.set_xticklabels(MODELS)
+    ax.set_ylabel("BERTScore Drop (post_gt − recon_gt)")
+    ax.set_title("Fig 9 — BERTScore Drop Distribution per Model")
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+    add_scale_lines(ax)
+    save(fig, "fig09_bertscore_drop_violin")
+
+
+def fig10(df):
+    """Cosine vs BERTScore drop scatter, all models overlaid."""
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for m in MODELS:
+        sub = df[df["model"] == m].dropna(subset=["bertscore_drop"])
+        ax.scatter(sub["reproj_cosine_recon"], sub["bertscore_drop"],
+                   alpha=0.3, s=8, color=MODEL_COLORS[m], label=m)
+    ax.set_xlabel("Reproj Cosine (recon)")
+    ax.set_ylabel("BERTScore Drop")
+    ax.set_title("Fig 10 — Cosine vs BERTScore Drop")
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.legend(markerscale=3)
+    add_scale_lines(ax)
+    save(fig, "fig10_cosine_vs_bertscore_drop")
+
+
+def fig11(df):
+    """CLIPScore drop vs BERTScore drop scatter."""
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for m in MODELS:
+        sub = df[df["model"] == m].dropna(subset=["bertscore_drop"])
+        ax.scatter(sub["clipscore_drop"], sub["bertscore_drop"],
+                   alpha=0.3, s=8, color=MODEL_COLORS[m], label=m)
+    ax.set_xlabel("CLIPScore Drop")
+    ax.set_ylabel("BERTScore Drop")
+    ax.set_title("Fig 11 — CLIPScore Drop vs BERTScore Drop")
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.legend(markerscale=3)
+    add_scale_lines(ax)
+    save(fig, "fig11_clipscore_drop_vs_bertscore_drop")
 
 
 def fig16(df):
@@ -278,6 +343,9 @@ if __name__ == "__main__":
     fig6(df)
     fig7(df)
     fig8(df)
+    fig9(df)
+    fig10(df)
+    fig11(df)
     fig16(df)
     fig17(df)
     fig18(df)
