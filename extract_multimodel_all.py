@@ -1,8 +1,7 @@
 import argparse
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
 import torch
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -76,7 +75,6 @@ def _dtype_from_str(s: str):
 
 
 def _from_pretrained_with_dtype(model_cls, model_id: str, dtype, trust_remote_code: bool = True):
-    # Newer transformers prefers dtype=..., some versions still require torch_dtype=...
     try:
         return model_cls.from_pretrained(model_id, dtype=dtype, trust_remote_code=trust_remote_code)
     except TypeError:
@@ -107,13 +105,6 @@ def load_model_and_processor(args,model_family: str, hf_model: str, processor_id
             if hasattr(processor.image_processor, "do_image_splitting"):
                 processor.image_processor.do_image_splitting = False
         model = _from_pretrained_with_dtype(AutoModelForImageTextToText, hf_model, dtype, trust_remote_code=True)
-
-    elif model_family == "chameleon":
-        from transformers import ChameleonForConditionalGeneration, ChameleonProcessor
-
-        
-        processor = ChameleonProcessor.from_pretrained(processor_id, trust_remote_code=True)
-        model = _from_pretrained_with_dtype(ChameleonForConditionalGeneration, hf_model, dtype, trust_remote_code=True)
 
     else:
         raise ValueError(f"Unsupported model_family: {model_family}")
@@ -217,32 +208,6 @@ def _decode_generated(processor, out_ids, input_ids, no_caption: bool):
     return [c.strip() for c in captions]
 
 
-def _extract_chameleon_batch(model, processor, keys: List[str], images: List[Image.Image], prompt: str, device: str, max_new_tokens: int, no_caption: bool):
-    pre_tokens: List[torch.Tensor] = []
-    post_tokens: List[torch.Tensor] = []
-    captions: List[str] = []
-
-    for im in images:
-        inputs = processor(images=im, text=prompt + "<image>", return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            quant, _, _ = model.model.vqmodel.encode(inputs["pixel_values"])
-            bpe_tokens = model.model.get_image_tokens(inputs["pixel_values"])
-            if no_caption:
-                caption = ""
-            else:
-                out_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-                gen_ids = out_ids[:, inputs["input_ids"].shape[1] :]
-                caption = processor.batch_decode(gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
-
-        pre_tokens.append(quant.detach().float().cpu())
-        post_tokens.append(bpe_tokens.detach().float().cpu())
-        captions.append(caption)
-
-    return keys, pre_tokens, post_tokens, captions
-
-
 @torch.inference_mode()
 def extract_vectors(
     model,
@@ -297,73 +262,53 @@ def extract_vectors(
             keep = max_items - seen
             keys = keys[:keep]
             images = images[:keep]
+        inputs = build_inputs(processor, model_family, images, prompt, img_size, device)
 
-        if model_family == "chameleon":
-            b_keys, b_pre_list, b_post_list, b_caps = _extract_chameleon_batch(
-                model=model,
-                processor=processor,
-                keys=keys,
-                images=images,
-                prompt=prompt,
-                device=device,
-                max_new_tokens=max_new_tokens,
-                no_caption=no_caption,
-            )
-            for j, k in enumerate(b_keys):
-                shard_keys.append(k)
-                shard_pre.append(b_pre_list[j])
-                shard_post.append(b_post_list[j])
-                shard_caps.append(b_caps[j])
-                seen += 1
+        got = {"ok": False}
+        pre_buf: List[torch.Tensor] = []
+        post_buf: List[torch.Tensor] = []
 
-        else:
-            inputs = build_inputs(processor, model_family, images, prompt, img_size, device)
+        def hook_connector(module, inp, out):
+            if got["ok"]:
+                return
+            x = inp[0]
+            y = out
+            bsz = len(keys)
+            if x.dim() == 2:
+                x = x.view(bsz, -1, x.size(-1))
+            if y.dim() == 2:
+                y = y.view(bsz, -1, y.size(-1))
+            pre_buf.append(x.detach().float().cpu())
+            post_buf.append(y.detach().float().cpu())
+            got["ok"] = True
 
-            got = {"ok": False}
-            pre_buf: List[torch.Tensor] = []
-            post_buf: List[torch.Tensor] = []
+        hook_module = resolve_hook_module(model, model_family)
+        if hook_module is None:
+            raise RuntimeError(f"Hook module not found for model_family={model_family}")
 
-            def hook_connector(module, inp, out):
-                if got["ok"]:
-                    return
-                x = inp[0]
-                y = out
-                bsz = len(keys)
-                if x.dim() == 2:
-                    x = x.view(bsz, -1, x.size(-1))
-                if y.dim() == 2:
-                    y = y.view(bsz, -1, y.size(-1))
-                pre_buf.append(x.detach().float().cpu())
-                post_buf.append(y.detach().float().cpu())
-                got["ok"] = True
+        h = hook_module.register_forward_hook(hook_connector)
+        out_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=0.0,
+            top_p=1.0,
+        )
+        h.remove()
 
-            hook_module = resolve_hook_module(model, model_family)
-            if hook_module is None:
-                raise RuntimeError(f"Hook module not found for model_family={model_family}")
+        if not got["ok"]:
+            raise RuntimeError(f"Hook did not fire for model_family={model_family}")
 
-            h = hook_module.register_forward_hook(hook_connector)
-            out_ids = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=0.0,
-                top_p=1.0,
-            )
-            h.remove()
+        captions = _decode_generated(processor, out_ids, inputs["input_ids"], no_caption=no_caption)
+        pre_tokens = pre_buf[0]
+        post_tokens = post_buf[0]
 
-            if not got["ok"]:
-                raise RuntimeError(f"Hook did not fire for model_family={model_family}")
-
-            captions = _decode_generated(processor, out_ids, inputs["input_ids"], no_caption=no_caption)
-            pre_tokens = pre_buf[0]
-            post_tokens = post_buf[0]
-
-            for j, k in enumerate(keys):
-                shard_keys.append(k)
-                shard_pre.append(pre_tokens[j : j + 1])
-                shard_post.append(post_tokens[j : j + 1])
-                shard_caps.append(captions[j])
-                seen += 1
+        for j, k in enumerate(keys):
+            shard_keys.append(k)
+            shard_pre.append(pre_tokens[j : j + 1])
+            shard_post.append(post_tokens[j : j + 1])
+            shard_caps.append(captions[j])
+            seen += 1
 
         if save_every > 0 and len(shard_keys) >= save_every:
             flush_shard(seen)

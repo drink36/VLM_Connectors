@@ -54,11 +54,18 @@ def load_caption_df(caption_dir: Path, model: str) -> pd.DataFrame:
             "bertscore_recall": "bertscore_recon_vs_post_recall",
         })
 
-    keep = ["key", "clipscore_drop", "clipscore_recon", "clipscore_post_direct", BERTSCORE_COL]
+    if "bertscore_post_vs_gt_f1" in df.columns and "bertscore_recon_vs_gt_f1" in df.columns:
+        df["bertscore_drop"] = df["bertscore_post_vs_gt_f1"] - df["bertscore_recon_vs_gt_f1"]
+    else:
+        df["bertscore_drop"] = float("nan")
+
+    keep = ["key", "reproj_cosine_recon", "reproj_mse_recon",
+            "clipscore_drop", "clipscore_recon", "clipscore_post_direct",
+            BERTSCORE_COL, "bertscore_drop"]
     keep = [c for c in keep if c in df.columns]
     out = df[keep].copy()
     out["norm_key"] = out["key"].map(normalize_key)
-    out = out.dropna(subset=["norm_key"]).drop_duplicates(subset=["norm_key"]) 
+    out = out.dropna(subset=["norm_key"]).drop_duplicates(subset=["norm_key"])
     return out
 
 
@@ -199,6 +206,83 @@ def fig20(df: pd.DataFrame, out_dir: Path):
     save(fig, out_dir, "pre_fig20_per_model_scatter")
 
 
+def fig_corr_scatter(df: pd.DataFrame, out_dir: Path):
+    """2×2 scatter grid: cosine_pre vs CLIPScore drop, one panel per model, with regression line."""
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    axes = axes.flatten()
+    for i, m in enumerate(MODELS):
+        ax = axes[i]
+        sub = df[df["model"] == m].dropna(subset=["cosine_pre", "clipscore_drop"])
+        x, y = sub["cosine_pre"].values, sub["clipscore_drop"].values
+        ax.scatter(x, y, alpha=0.25, s=6, color=MODEL_COLORS[m])
+        if len(x) > 1:
+            m_coef, b = np.polyfit(x, y, 1)
+            xline = np.linspace(x.min(), x.max(), 200)
+            ax.plot(xline, m_coef * xline + b, color="black", linewidth=1.5, linestyle="--")
+            r = np.corrcoef(x, y)[0, 1]
+            ax.text(0.05, 0.93, f"r = {r:.3f}", transform=ax.transAxes,
+                    fontsize=9, va="top")
+        ax.set_title(m)
+        ax.set_xlabel("Cosine(E_pre_hat, E_pre)")
+        ax.set_ylabel("CLIPScore Drop")
+        add_scale_lines(ax)
+    fig.suptitle("E_pre Recoverability vs Semantic Degradation (with regression)", fontsize=12)
+    fig.tight_layout()
+    save(fig, out_dir, "corr_scatter_cosine_pre_vs_clipscore_drop")
+
+
+def make_corr_table(corr_path: Path, out_dir: Path):
+    """Format correlation CSV into a print table and LaTeX tabular."""
+    df = pd.read_csv(corr_path)
+    model_order = ["llava", "idefics2", "qwen2.5vl", "qwen3.5"]
+    model_labels = {"llava": "LLaVA", "idefics2": "Idefics2",
+                    "qwen2.5vl": "Qwen-2.5-VL", "qwen3.5": "Qwen-3.5"}
+    pairs = [
+        ("cosine_pre", "clipscore_drop",             "cos→CLIP↓"),
+        ("mse_pre",    "clipscore_drop",             "MSE→CLIP↓"),
+        ("cosine_pre", "bertscore_recon_vs_post_f1", "cos→BERT"),
+        ("mse_pre",    "bertscore_recon_vs_post_f1", "MSE→BERT"),
+    ]
+
+    rows = []
+    for m in model_order:
+        sub = df[df["model"] == m]
+        row = {"Model": model_labels[m]}
+        for x, y, label in pairs:
+            match = sub[(sub["x"] == x) & (sub["y"] == y)]
+            if not match.empty:
+                p = match.iloc[0]["pearson_r"]
+                s = match.iloc[0]["spearman_r"]
+                row[label] = f"{p:.3f} ({s:.3f})"
+            else:
+                row[label] = "—"
+        rows.append(row)
+
+    tbl = pd.DataFrame(rows)
+    print("\n=== Correlation Table: Pearson r (Spearman r) ===")
+    print(tbl.to_string(index=False))
+
+    # save CSV
+    csv_out = out_dir / "corr_table.csv"
+    tbl.to_csv(csv_out, index=False)
+    print(f"  saved {csv_out}")
+
+    # save LaTeX
+    col_labels = ["Model"] + [p[2] for p in pairs]
+    lines = [
+        r"\begin{tabular}{l" + "c" * len(pairs) + "}",
+        r"\toprule",
+        " & ".join(col_labels) + r" \\",
+        r"\midrule",
+    ]
+    for row in rows:
+        lines.append(" & ".join(str(row[c]) for c in col_labels) + r" \\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    latex_out = out_dir / "corr_table.tex"
+    latex_out.write_text("\n".join(lines))
+    print(f"  saved {latex_out}")
+
+
 def write_correlations(df: pd.DataFrame, corr_out: Path):
     pairs = [
         ("cosine_pre", "clipscore_drop"),
@@ -261,6 +345,10 @@ def main():
         fig8(df, out_dir)
         fig19(df, out_dir)
         fig20(df, out_dir)
+        fig_corr_scatter(df, out_dir)
+
+    print("Building correlation table...")
+    make_corr_table(corr_out, out_dir)
 
     print("Done.")
 

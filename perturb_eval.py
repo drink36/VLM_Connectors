@@ -23,13 +23,15 @@ import torch.nn as nn
 from torch.amp import autocast
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import (
-    AutoModelForImageTextToText,
-    AutoProcessor,
-    LlavaForConditionalGeneration,
-    Idefics2ForConditionalGeneration,
+
+from vlm_utils import (
+    build_image_index,
+    build_vlm_inputs,
+    decode_outputs,
+    load_vlm,
+    numeric_suffix,
+    resolve_connector,
 )
-from transformers.image_utils import load_image
 
 
 # ---------------------------------------------------------------------------
@@ -41,9 +43,6 @@ class ShardSample(TypedDict):
     sample_id: str
 
 
-def numeric_suffix(path: Path) -> int:
-    match = re.search(r"_(\d+)\.pt$", path.name)
-    return int(match.group(1)) if match else 10**18
 
 
 class PostVectorDataset(Dataset):
@@ -173,91 +172,6 @@ def perturb(post: torch.Tensor, mode: str, level: float, sample_ids: list[str], 
 # VLM helpers
 # ---------------------------------------------------------------------------
 
-MODEL_IDS = {
-    "llava":    "llava-hf/llava-1.5-7b-hf",
-    "idefics2": "HuggingFaceM4/idefics2-8b",
-    "qwen2.5vl": "Qwen/Qwen2.5-VL-7B-Instruct",
-    "qwen3.5": "Qwen/Qwen3.5-9B",
-}
-
-
-def load_vlm(model_name: str, img_size: int, device: torch.device):
-    model_id = MODEL_IDS[model_name]
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-
-    if model_name == "idefics2" and hasattr(processor, "image_processor"):
-        processor.image_processor.size = {"longest_edge": img_size, "shortest_edge": img_size}
-        if hasattr(processor.image_processor, "do_image_splitting"):
-            processor.image_processor.do_image_splitting = False
-
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
-    if model_name == "llava":
-        model = LlavaForConditionalGeneration.from_pretrained(model_id, dtype=dtype)
-    elif model_name == "idefics2":
-        model = Idefics2ForConditionalGeneration.from_pretrained(model_id, dtype=dtype, trust_remote_code=True)
-    else:
-        model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=dtype, trust_remote_code=True)
-
-    return processor, model.to(device).eval()
-
-
-def build_inputs(processor, image_paths: list[str], prompt: str, model_name: str, img_size: int, device: torch.device):
-    images = [load_image(p).resize((img_size, img_size)) for p in image_paths]
-
-    if model_name in ("llava", "idefics2"):
-        template = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
-        text = processor.apply_chat_template(template, add_generation_prompt=True)
-        img_arg = images if model_name == "llava" else [[im] for im in images]
-        inputs = processor(images=img_arg, text=[text] * len(images), padding=True, return_tensors="pt")
-        return {k: v.to(device) for k, v in inputs.items()}
-
-    from qwen_vl_utils import process_vision_info
-    templates = [[{"role": "user", "content": [{"type": "image", "image": im}, {"type": "text", "text": prompt}]}] for im in images]
-    tmpl_kwargs = {"enable_thinking": False} if model_name == "qwen3.5" else {}
-    texts = [processor.apply_chat_template(t, tokenize=False, add_generation_prompt=True, **tmpl_kwargs) for t in templates]
-    image_inputs, video_inputs = process_vision_info(templates)
-    inputs = processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
-    return {k: v.to(device) for k, v in inputs.items()}
-
-
-def decode_outputs(processor, out_ids: torch.Tensor, input_ids: torch.Tensor, model_name: str) -> list[str]:
-    import re
-    if model_name == "qwen2.5vl":
-        pad_id = processor.tokenizer.pad_token_id
-        results = []
-        for i, row in enumerate(input_ids):
-            plen = (row != pad_id).sum().item() if pad_id is not None else input_ids.shape[1]
-            txt = processor.batch_decode(out_ids[i, plen:].unsqueeze(0), skip_special_tokens=True)[0]
-            results.append(txt.strip())
-        return results
-    gen = out_ids[:, input_ids.shape[1]:]
-    texts = [c.strip() for c in processor.batch_decode(gen, skip_special_tokens=True)]
-    if model_name == "qwen3.5":
-        texts = [re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL).strip() for t in texts]
-    return texts
-
-
-def resolve_connector(model: nn.Module, model_name: str) -> nn.Module:
-    mods = dict(model.named_modules())
-    if model_name == "llava":
-        mod = mods.get("multi_modal_projector") or mods.get("model.multi_modal_projector")
-    elif model_name == "idefics2":
-        mod = mods.get("model.connector") or mods.get("connector")
-    else:
-        mod = mods.get("visual.merger") or mods.get("model.visual.merger")
-    if mod is None:
-        raise RuntimeError(f"connector not found for {model_name}")
-    return mod
-
-
-def build_image_index(image_dir: str) -> dict[str, str]:
-    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    index = {}
-    for p in Path(image_dir).rglob("*"):
-        if p.suffix.lower() in exts:
-            if p.stem not in index:
-                index[p.stem] = str(p)
-    return index
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +229,7 @@ def run(args: argparse.Namespace) -> None:
                 kept_paths = [paths[i] for i in kept]
                 post_gt    = batch["post"][kept].to(device)
 
-                vlm_inputs = build_inputs(processor, kept_paths, args.prompt, args.model_name, args.img_size, device)
+                vlm_inputs = build_vlm_inputs(processor, kept_paths, args.prompt, args.model_name, args.img_size, device)
 
                 # --- baseline: original caption (no injection) ---
                 with autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):

@@ -5,4 +5,5 @@ test.md
 knn_out/
 *.out
 wandb/
+history/
 __pycache__/

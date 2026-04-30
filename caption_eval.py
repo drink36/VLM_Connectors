@@ -18,13 +18,15 @@ from PIL import Image
 from torch.amp import autocast
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import (
-    AutoModelForImageTextToText,
-    AutoProcessor,
-    LlavaForConditionalGeneration,
-    Idefics2ForConditionalGeneration,
+
+from vlm_utils import (
+    build_image_index,
+    build_vlm_inputs,
+    decode_outputs,
+    load_vlm,
+    numeric_suffix,
+    resolve_connector,
 )
-from transformers.image_utils import load_image
 
 
 
@@ -33,9 +35,6 @@ class ShardSample(TypedDict):
     sample_id: str
 
 
-def numeric_suffix(path: Path) -> int:
-    match = re.search(r"_(\d+)\.pt$", path.name)
-    return int(match.group(1)) if match else 10**18
 
 
 class ShardPairVectorDataset(Dataset):
@@ -374,160 +373,6 @@ def extract_key_from_sample_id(sample_id: str) -> str:
     return parts[2] if len(parts) == 3 else sample_id
 
 
-def build_image_index(image_dir: str) -> dict[str, str]:
-    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    key_to_path: dict[str, str] = {}
-    for path in Path(image_dir).rglob("*"):
-        if path.suffix.lower() not in exts:
-            continue
-        key = path.stem
-        if key in key_to_path and key_to_path[key] != str(path):
-            print(f"[warn] duplicate image key {key}; keeping first path")
-            continue
-        key_to_path[key] = str(path)
-    return key_to_path
-
-
-
-def resolve_vlm_model_id(args: argparse.Namespace) -> str:
-    if args.vlm_model_id:
-        return args.vlm_model_id
-    if args.embed_model == "llava":
-        return "llava-hf/llava-1.5-7b-hf"
-    if args.embed_model == "idefics2":
-        return "HuggingFaceM4/idefics2-8b"
-    if args.embed_model == "qwen2.5vl":
-        return "Qwen/Qwen2.5-VL-7B-Instruct"
-    if args.embed_model == "qwen3.5":
-        return "Qwen/Qwen3.5-9B"
-    raise ValueError(f"no default VLM id for embed_model={args.embed_model}; set --vlm_model_id")
-
-
-def load_vlm_for_caption(args: argparse.Namespace, device: torch.device):
-    model_id = resolve_vlm_model_id(args)
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-
-    if args.embed_model == "idefics2" and hasattr(processor, "image_processor"):
-        processor.image_processor.size = {"longest_edge": args.img_size, "shortest_edge": args.img_size}
-        if hasattr(processor.image_processor, "do_image_splitting"):
-            processor.image_processor.do_image_splitting = False
-
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
-
-    if args.embed_model == "llava":
-        model = LlavaForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype)
-    elif args.embed_model == "idefics2":
-        model = Idefics2ForConditionalGeneration.from_pretrained(
-            model_id, torch_dtype=dtype, trust_remote_code=True
-        )
-    elif args.embed_model in ("qwen2.5vl", "qwen3.5"):
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_id, torch_dtype=dtype, trust_remote_code=True
-        )
-    else:
-        raise ValueError(f"caption compare supports only llava / idefics2 / qwen2.5vl / qwen3.5")
-
-    model = model.to(device)
-    model.eval()
-    return processor, model
-
-
-def build_vlm_inputs(
-    processor,
-    image_paths: list[str],
-    prompt: str,
-    device: torch.device,
-    embed_model: str,
-    img_size: int,
-) -> dict[str, torch.Tensor]:
-    images = [load_image(p) for p in image_paths]
-    if img_size and img_size > 0:
-        images = [im.resize((img_size, img_size)) for im in images]
-
-    if embed_model in ("llava", "idefics2"):
-        template = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
-        text = processor.apply_chat_template(template, add_generation_prompt=True)
-        prompts = [text] * len(images)
-        img_arg = images if embed_model == "llava" else [[im] for im in images]
-        inputs = processor(images=img_arg, text=prompts, padding=True, return_tensors="pt")
-        return {k: v.to(device) for k, v in inputs.items()}
-
-    if embed_model in ("qwen2.5vl", "qwen3.5"):
-        from qwen_vl_utils import process_vision_info
-
-        templates = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": im},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            for im in images
-        ]
-        tmpl_kwargs = {"enable_thinking": False} if embed_model == "qwen3.5" else {}
-        texts = [processor.apply_chat_template(t, tokenize=False, add_generation_prompt=True, **tmpl_kwargs) for t in templates]
-        image_inputs, video_inputs = process_vision_info(templates)
-        inputs = processor(
-            text=texts,
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        return {k: v.to(device) for k, v in inputs.items()}
-
-    raise ValueError(f"unsupported embed_model={embed_model}")
-
-
-def get_prompt_token_len(processor, input_ids: torch.Tensor, embed_model: str) -> list[int]:
-    if embed_model in ("qwen2.5vl", "qwen3.5"):
-        pad_id = processor.tokenizer.pad_token_id
-        if pad_id is None:
-            return [input_ids.shape[1]] * input_ids.shape[0]
-        return [(row != pad_id).sum().item() for row in input_ids]
-    return [input_ids.shape[1]] * input_ids.shape[0]
-
-
-def decode_outputs(processor, out_ids: torch.Tensor, input_ids: torch.Tensor, embed_model: str) -> list[str]:
-    if embed_model in ("qwen2.5vl", "qwen3.5"):
-        prompt_lens = get_prompt_token_len(processor, input_ids, embed_model)
-        texts: list[str] = []
-        for i, plen in enumerate(prompt_lens):
-            gen_ids = out_ids[i, plen:]
-            txt = processor.batch_decode(
-                gen_ids.unsqueeze(0),
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )[0]
-            texts.append(txt.strip())
-        return texts
-
-    gen_only = out_ids[:, input_ids.shape[1] :]
-    captions = processor.batch_decode(
-        gen_only,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )
-    return [c.strip() for c in captions]
-
-
-
-def resolve_connector_module(vlm_model: nn.Module, embed_model: str) -> nn.Module:
-    mods = dict(vlm_model.named_modules())
-    if embed_model == "llava":
-        mod = mods.get("multi_modal_projector") or mods.get("model.multi_modal_projector")
-    elif embed_model == "idefics2":
-        mod = mods.get("model.connector") or mods.get("connector")
-    elif embed_model in ("qwen2.5vl", "qwen3.5"):
-        mod = mods.get("visual.merger") or mods.get("model.visual.merger")
-    else:
-        mod = None
-    if mod is None:
-        raise RuntimeError(f"failed to locate connector module for embed_model={embed_model}")
-    return mod
 
 
 def reshape_like(src: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -628,8 +473,8 @@ def run_caption_compare(
     if not args.image_dir:
         raise ValueError("--image_dir is required")
 
-    processor, vlm_model = load_vlm_for_caption(args, device)
-    connector = resolve_connector_module(vlm_model, args.embed_model)
+    processor, vlm_model = load_vlm(args.embed_model, args.img_size, device)
+    connector = resolve_connector(vlm_model, args.embed_model)
 
     key_to_path = build_image_index(args.image_dir)
     if not key_to_path:
@@ -735,9 +580,9 @@ def run_caption_compare(
                 processor=processor,
                 image_paths=kept_paths,
                 prompt=args.caption_prompt,
-                device=device,
-                embed_model=args.embed_model,
+                model_name=args.embed_model,
                 img_size=args.img_size,
+                device=device,
             )
 
             # GT captions from .txt files (image vs GT = reference CLIPScore)

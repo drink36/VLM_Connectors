@@ -4,7 +4,6 @@ Figures 1-8, 16-20 use per-image CSV data.
 Figures 9-12 (PCA/masking curves) and 13-15 (eRank) need separate data sources.
 """
 
-import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -329,6 +328,188 @@ def fig20(df):
     save(fig, "fig20_per_model_scatter")
 
 
+# All pairs computed and saved to CSV for full transparency
+CORR_PAIRS = [
+    ("reproj_cosine_recon", "clipscore_drop",  "cos→CLIPScore Drop"),
+    ("reproj_mse_recon",    "clipscore_drop",  "MSE→CLIPScore Drop"),
+    ("reproj_cosine_recon", BERTSCORE_COL,     "cos→BERTScore(recon/post)"),
+    ("reproj_mse_recon",    BERTSCORE_COL,     "MSE→BERTScore(recon/post)"),
+    ("reproj_cosine_recon", "bertscore_drop",  "cos→BERTScore Drop"),
+    ("reproj_mse_recon",    "bertscore_drop",  "MSE→BERTScore Drop"),
+]
+
+# Subset used in paper Table 1
+PAPER_CORR_PAIRS = [
+    ("reproj_cosine_recon", "clipscore_drop",  r"cos$\to$CLIP$\downarrow$"),
+    ("reproj_mse_recon",    "clipscore_drop",  r"MSE$\to$CLIP$\downarrow$"),
+    ("reproj_cosine_recon", BERTSCORE_COL,     r"cos$\to$BERT$\uparrow$"),
+    ("reproj_mse_recon",    BERTSCORE_COL,     r"MSE$\to$BERT$\uparrow$"),
+]
+
+MODEL_LABELS = {
+    "llava": "LLaVA", "idefics2": "Idefics2",
+    "qwen2.5vl": "Qwen-2.5-VL", "qwen3.5": "Qwen-3.5",
+}
+
+
+def _stars(p):
+    if p is None: return ""
+    if p < 0.001: return r"$^{***}$"
+    if p < 0.01:  return r"$^{**}$"
+    if p < 0.05:  return r"$^{*}$"
+    return ""
+
+
+def make_corr_table(df):
+    from scipy.stats import pearsonr, spearmanr
+
+    rows = []
+    for m in MODELS:
+        sub = df[df["model"] == m]
+        row = {"Model": MODEL_LABELS[m]}
+        for x, y, label in CORR_PAIRS:
+            pair = sub[[x, y]].dropna()
+            if len(pair) > 1:
+                pr, pp = pearsonr(pair[x], pair[y])
+                sr, sp = spearmanr(pair[x], pair[y])
+                row[f"{label}_pearson_r"]  = round(pr, 4)
+                row[f"{label}_pearson_p"]  = round(pp, 4)
+                row[f"{label}_spearman_r"] = round(sr, 4)
+                row[f"{label}_spearman_p"] = round(sp, 4)
+            else:
+                for suffix in ["_pearson_r", "_pearson_p", "_spearman_r", "_spearman_p"]:
+                    row[f"{label}{suffix}"] = None
+        rows.append(row)
+
+    tbl = pd.DataFrame(rows)
+
+    print("\n=== Correlation Table: Pearson r (p) / Spearman ρ (p) ===")
+    for _, row in tbl.iterrows():
+        print(f"\n  {row['Model']}")
+        for x, y, label in CORR_PAIRS:
+            pr = row.get(f"{label}_pearson_r")
+            pp = row.get(f"{label}_pearson_p")
+            sr = row.get(f"{label}_spearman_r")
+            sp = row.get(f"{label}_spearman_p")
+            if pr is not None:
+                print(f"    {label:35s}  r={pr:+.4f} p={pp:.4f}  ρ={sr:+.4f} p={sp:.4f}")
+            else:
+                print(f"    {label:35s}  —")
+
+    out_csv = Path("results/caption_recon_correlations.csv")
+    tbl.to_csv(out_csv, index=False)
+    print(f"\n  saved {out_csv}")
+
+    # Build a (x,y) → data lookup so PAPER_CORR_PAIRS (different labels) can find values
+    def _key(x, y): return f"{x}||{y}"
+
+    # LaTeX Table 1: 4 paper pairs, format "r (ρ)***"
+    col_labels = ["Model"] + [p[2] for p in PAPER_CORR_PAIRS]
+    lines = [
+        r"\begin{tabular}{l" + "c" * len(PAPER_CORR_PAIRS) + "}",
+        r"\toprule",
+        " & ".join(col_labels) + r" \\",
+        r"\midrule",
+    ]
+    for row in rows:
+        # re-index this row by (x, y) key
+        xy_lookup = {}
+        for x, y, lbl in CORR_PAIRS:
+            k = _key(x, y)
+            xy_lookup[k] = {
+                "pearson_r": row.get(f"{lbl}_pearson_r"),
+                "pearson_p": row.get(f"{lbl}_pearson_p"),
+                "spearman_r": row.get(f"{lbl}_spearman_r"),
+            }
+        cells = [row["Model"]]
+        for x, y, _ in PAPER_CORR_PAIRS:
+            vals = xy_lookup.get(_key(x, y), {})
+            pr = vals.get("pearson_r")
+            pp = vals.get("pearson_p")
+            sr = vals.get("spearman_r")
+            if pr is None or (isinstance(pr, float) and pd.isna(pr)):
+                cells.append("—")
+            else:
+                cells.append(f"{pr:.3f}{_stars(pp)} ({sr:.3f})")
+        lines.append(" & ".join(cells) + r" \\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    out_tex = Path("results/caption_recon_correlations.tex")
+    out_tex.write_text("\n".join(lines))
+    print(f"  saved {out_tex}")
+
+
+def fig_corr_scatter(df):
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    axes = axes.flatten()
+    for i, m in enumerate(MODELS):
+        ax = axes[i]
+        sub = df[df["model"] == m].dropna(subset=["reproj_cosine_recon", "clipscore_drop"])
+        x, y = sub["reproj_cosine_recon"].values, sub["clipscore_drop"].values
+        ax.scatter(x, y, alpha=0.25, s=6, color=MODEL_COLORS[m])
+        if len(x) > 1:
+            coef, b = np.polyfit(x, y, 1)
+            xline = np.linspace(x.min(), x.max(), 200)
+            ax.plot(xline, coef * xline + b, color="black", linewidth=1.5, linestyle="--")
+            r = np.corrcoef(x, y)[0, 1]
+            ax.text(0.05, 0.93, f"r = {r:.3f}", transform=ax.transAxes, fontsize=9, va="top")
+        ax.set_title(MODEL_LABELS[m])
+        ax.set_xlabel("Reproj Cosine (recon)")
+        ax.set_ylabel("CLIPScore Drop")
+        add_scale_lines(ax)
+    fig.suptitle("Connector Inversion Quality vs Semantic Degradation", fontsize=12)
+    fig.tight_layout()
+    save(fig, "fig_corr_scatter")
+
+
+def make_spectral_table(knn_csv: Path = Path("results/knn_summary_per_model.csv")):
+    """Table 3: spectral diagnostics per model (post-connector)."""
+    if not knn_csv.exists():
+        print(f"  [skip] {knn_csv} not found — run knn analysis first")
+        return
+
+    df = pd.read_csv(knn_csv)
+    model_order  = ["llava", "idefics2", "qwen2.5vl", "qwen3.5"]
+    model_labels = {"llava": "LLaVA", "idefics2": "Idefics2",
+                    "qwen2.5vl": "Qwen-2.5-VL", "qwen3.5": "Qwen-3.5"}
+
+    rows = []
+    for m in model_order:
+        row = df[df["model"] == m]
+        if row.empty:
+            continue
+        r = row.iloc[0]
+        rows.append({
+            "Model":         model_labels[m],
+            "r_eff_post":    f"{r['post_effective_rank_mean']:.2f}",
+            "norm_r_eff":    f"{r['post_effective_rank_normalized_mean']:.3f}",
+            "top10_energy":  f"{r['post_top10_energy_ratio_mean']:.3f}",
+            "knor10":        f"{r['pre_post_knor10_mean']:.3f}",
+        })
+
+    print("\n=== Table 3: Spectral Diagnostics (post-connector) ===")
+    for r in rows:
+        print(f"  {r['Model']:15s}  r_eff={r['r_eff_post']:6s}  norm={r['norm_r_eff']}  "
+              f"top10={r['top10_energy']}  KNOR@10={r['knor10']}")
+
+    col_labels = [r"Model", r"$r_{\mathrm{eff}}^{\mathrm{post}}$",
+                  r"Norm.\ $r_{\mathrm{eff}}$", r"Top-10 energy", r"KNOR@10"]
+    lines = [
+        r"\begin{tabular}{lcccc}",
+        r"\toprule",
+        " & ".join(col_labels) + r" \\",
+        r"\midrule",
+    ]
+    for r in rows:
+        lines.append(
+            f"{r['Model']} & {r['r_eff_post']} & {r['norm_r_eff']} "
+            f"& {r['top10_energy']} & {r['knor10']}" + r" \\"
+        )
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    out_tex = Path("results/spectral_diagnostics.tex")
+    out_tex.write_text("\n".join(lines))
+    print(f"  saved {out_tex}")
+
+
 if __name__ == "__main__":
     print("Loading data...")
     df = load_all()
@@ -351,6 +532,12 @@ if __name__ == "__main__":
     fig18(df)
     fig19(df)
     fig20(df)
+    fig_corr_scatter(df)
 
-    print(f"\nDone. All figures saved to {OUT_DIR}/")
-    print("Figures 9-12 (PCA/masking curves) and 13-15 (eRank) need separate data sources.")
+    print("\nBuilding correlation table (Table 1)...")
+    make_corr_table(df)
+
+    print("\nBuilding spectral diagnostics table (Table 3)...")
+    make_spectral_table()
+
+    print(f"\nDone. Figures → {OUT_DIR}/   Tables → results/")
