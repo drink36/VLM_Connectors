@@ -13,7 +13,7 @@ PERTURB_DIR=${1:-data/perturb_out}
 
 conda activate nlp_p
 
-python score_perturb.py \
+python src/eval/score_perturb.py \
     --perturb_dir ${PERTURB_DIR} \
     --out_dir data/perturb_out_scored \
     --batch_size 16 \

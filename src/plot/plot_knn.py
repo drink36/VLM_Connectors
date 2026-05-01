@@ -682,7 +682,7 @@ def build_model_json_map(base: str, models: dict[str, str], json_name: str) -> d
 
 
 if __name__ == "__main__":
-    base = "data/output/knn_out"
+    base = "sample/knn_out"
     save_base = "figures/knn"
     json_name = "overlap_top100_l2_torch.json"
 

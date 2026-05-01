@@ -11,4 +11,4 @@
 
 
 conda activate nlp_p
-python extract_clip_ref.py       --root data/mtf2025_web_images       --out_dir data/dinov3_ref       --model_id facebook/dinov3-vitl16-pretrain-lvd1689m      --pool cls --batch_size 32 --device cuda
+python src/extract/extract.py       --root data/mtf2025_web_images       --out_dir data/dinov3_ref       --model_id facebook/dinov3-vitl16-pretrain-lvd1689m      --pool cls --batch_size 32 --device cuda

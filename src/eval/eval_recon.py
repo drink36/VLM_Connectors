@@ -39,7 +39,7 @@ ALL_SHARDS = [f"{i:05d}" for i in range(14)]
 def load_recon_model(model_dir: str, device: torch.device):
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
-    from reconstruct_embeddings import build_model
+    from ..train.train_recon import build_model
 
     ckpt_path = Path(model_dir) / "best_model.pt"
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)

@@ -33,7 +33,12 @@ from vlm_utils import (
     resolve_connector,
 )
 
-
+MODEL_IDS = {
+    "llava":     "llava-hf/llava-1.5-7b-hf",
+    "idefics2":  "HuggingFaceM4/idefics2-8b",
+    "qwen2.5vl": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "qwen3.5":   "Qwen/Qwen3.5-9B",
+}
 # ---------------------------------------------------------------------------
 # Shard dataset (post embeddings only)
 # ---------------------------------------------------------------------------

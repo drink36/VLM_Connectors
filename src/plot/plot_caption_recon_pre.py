@@ -315,8 +315,8 @@ def write_correlations(df: pd.DataFrame, corr_out: Path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--caption_dir", default="data/output/caption_compare_out_nor")
-    p.add_argument("--pre_dir", default="data/output/recon_pre_eval")
+    p.add_argument("--caption_dir", default="sample/caption_compare_out_nor")
+    p.add_argument("--pre_dir", default="sample/recon_pre_eval")
     p.add_argument("--out_dir", default="figures/caption_recon_pre")
     p.add_argument("--corr_out", default="results/caption_recon_pre_correlations.csv")
     p.add_argument("--no_plots", action="store_true")

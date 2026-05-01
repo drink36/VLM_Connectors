@@ -4,8 +4,8 @@ Uses perturb_out_scored CSVs (5000 samples) joined with per_image.csv on key.
 
 Usage:
   python plot_erank_vs_clip.py
-  python plot_erank_vs_clip.py --perturb_dir data/perturb_out_scored \
-                                --knn_base data/output/knn_out \
+    python plot_erank_vs_clip.py --perturb_dir sample/perturb_out_scored \
+                                                                --knn_base sample/knn_out \
                                 --out figures/erank_vs_clip
 """
 import argparse
@@ -64,8 +64,8 @@ def plot_model(ax, df, display_name, color):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--perturb_dir", default="data/perturb_out_scored")
-    p.add_argument("--knn_base", default="data/output/knn_out")
+    p.add_argument("--perturb_dir", default="sample/perturb_out_scored")
+    p.add_argument("--knn_base", default="sample/knn_out")
     p.add_argument("--out", default="figures/erank_vs_clip")
     args = p.parse_args()
 

@@ -112,7 +112,7 @@ def plot_score(df, out_path, perturb):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--scored_dir", default="data/perturb_out_scored")
+    p.add_argument("--scored_dir", default="sample/perturb_out_scored")
     p.add_argument("--perturb", choices=["lowrank", "mask"], default="lowrank")
     p.add_argument("--mode", choices=["drop", "score"], default="drop")
     p.add_argument("--out", default="")

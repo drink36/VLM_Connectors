@@ -13,7 +13,7 @@ MODEL=${1:-llava}
 
 conda activate nlp_p
 
-python knn.py \
+python src/extract/extract_knn.py \
     --pre_pt data/vector/${MODEL} \
     --post_pt data/vector/${MODEL} \
     --ref clip:data/clip_ref \

@@ -9,7 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-DATA_DIR = Path("data/output/caption_compare_out_nor")
+DATA_DIR = Path("sample/caption_compare_out_nor")
 OUT_DIR = Path("figures/caption_recon")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 

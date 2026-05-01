@@ -25,4 +25,4 @@ if [ -n "${SHARDS}" ]; then
     ARGS="${ARGS} --shards ${SHARDS}"
 fi
 
-python export_recon_vectors.py ${ARGS}
+python src/train/export_recon.py ${ARGS}

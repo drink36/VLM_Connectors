@@ -11,4 +11,4 @@
 
 
 conda activate nlp_p
-python extract_clip_ref.py       --root data/mtf2025_web_images       --out_dir data/clip_ref       --model_id openai/clip-vit-large-patch14    --pool cls --batch_size 32 --device cuda
+python src/extract/extract_clip.py       --root data/mtf2025_web_images       --out_dir data/clip_ref       --model_id openai/clip-vit-large-patch14    --pool cls --batch_size 32 --device cuda

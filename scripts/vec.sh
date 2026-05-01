@@ -11,4 +11,4 @@
 
 
 conda activate nlp_p
-python extract_multimodel_all.py --root data/mtf2025_web_images --out_dir data/vector --models all --device cuda --dtype bf16 --batch_size 32 --num_workers 4 --save_every 400 --skip_existing
+python src/extract/extract_vectors.py --root data/mtf2025_web_images --out_dir data/vector --models all --device cuda --dtype bf16 --batch_size 32 --num_workers 4 --save_every 400 --skip_existing

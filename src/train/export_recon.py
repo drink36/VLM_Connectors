@@ -43,7 +43,7 @@ VLM_IDS = {
 def load_recon_model(model_path, stats_path, device):
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
-    from reconstruct_embeddings import build_model
+    from train.train_recon import build_model
     import argparse as ap
 
     ckpt = torch.load(model_path, map_location="cpu", weights_only=False)

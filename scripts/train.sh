@@ -33,7 +33,7 @@ if [ "${EXPORT}" = "1" ]; then
     EXPORT_ARGS="--export_post_vectors --export_dir ${EXPORT_DIR}"
 fi
 
-python train_connector.py \
+python src/train/train_connector.py \
     --embed_model ${MODEL} \
     --connector_type ${CONNECTOR} \
     --vec_dir ${VEC_DIR} \

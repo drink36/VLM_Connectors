@@ -41,7 +41,7 @@ case ${MODEL} in
         echo "Unknown model: ${MODEL}"; exit 1 ;;
 esac
 
-python reconstruct_embeddings.py \
+python src/train/train_recon.py \
   --vec_dir ${VEC_DIR} \
   --embed_model ${MODEL} \
   --model_type ${MODEL_TYPE} \
