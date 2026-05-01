@@ -15,7 +15,10 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset, Sampler, random_split
 from tqdm import tqdm
@@ -609,7 +612,7 @@ def train_model(
             train_loss += loss.item() * config.accumulation_steps
             train_loader_tqdm.set_postfix({"Batch Loss": loss.item() * config.accumulation_steps})
 
-            if batch_idx % config.log_interval == 0:
+            if getattr(config, "use_wandb", False) and batch_idx % config.log_interval == 0:
                 wandb.log(
                     {
                         "batch_loss": loss.item() * config.accumulation_steps,
@@ -661,22 +664,24 @@ def train_model(
             best_val_loss = val_loss
             best_model = model.state_dict()
             save_checkpoint(best_model, args, config)
-            wandb.save(os.path.join(args.out_dir, "best_model.pt"))
+            if getattr(config, "use_wandb", False):
+                wandb.save(os.path.join(args.out_dir, "best_model.pt"))
             patience_counter = 0
             print("model saved to", os.path.join(args.out_dir, "best_model.pt"))
         else:
             patience_counter += 1
 
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "best_val_loss": best_val_loss,
-                "learning_rate": optimizer.param_groups[0]["lr"],
-                "patience_counter": patience_counter,
-            }
-        )
+        if getattr(config, "use_wandb", False):
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "best_val_loss": best_val_loss,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                    "patience_counter": patience_counter,
+                }
+            )
 
         print(f"Epoch {epoch+1}/{config.num_epochs}:")
         print(f"Train Loss: {train_loss:.6f}")
@@ -824,6 +829,7 @@ def build_config(args: argparse.Namespace) -> SimpleNamespace:
     config.accumulation_steps = args.accumulation_steps
     config.patience = args.patience
     config.min_delta = args.min_delta
+    config.use_wandb = bool(getattr(args, "use_wandb", False))
     return config
 
 
@@ -895,11 +901,15 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    run_name = (
-        f"{args.embed_model}_reconstruction_{args.model_type}"
-        f"_bs{args.batch_size}_lr{args.lr}_hidden{args.hidden_size}"
-    )
-    wandb.init(project="embedding-transformer", name=run_name)
+    args.use_wandb = (not args.eval_only) and wandb is not None
+    if not args.eval_only and wandb is None:
+        print("WARNING: wandb not installed, continuing without wandb logging")
+    if args.use_wandb:
+        run_name = (
+            f"{args.embed_model}_reconstruction_{args.model_type}"
+            f"_bs{args.batch_size}_lr{args.lr}_hidden{args.hidden_size}"
+        )
+        wandb.init(project="embedding-transformer", name=run_name)
 
     dataset = ShardPairVectorDataset(
         vec_dir=args.vec_dir or None,

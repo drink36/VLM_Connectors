@@ -33,7 +33,7 @@ case ${MODEL} in
         echo "Unknown model: ${MODEL}"; exit 1 ;;
 esac
 
-python src/eval/caption_eval.py \
+python src/eval/eval_caption.py \
     --vec_dir data/vector/${MODEL} \
     --image_dir data/mtf2025_web_images \
     --embed_model ${MODEL} \

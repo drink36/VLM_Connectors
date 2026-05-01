@@ -13,7 +13,7 @@ MODE=${2:-lowrank}
 LEVEL=${3:-0.01}
 
 conda activate nlp_p
-python src/eval/perturb_eval.py \
+python src/eval/eval_perturb.py \
     --vec_dir data/vector/${MODEL}/00000 \
     --image_dir data/mtf2025_web_images/00000 \
     --model_name ${MODEL} \

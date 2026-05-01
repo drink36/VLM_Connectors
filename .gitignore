@@ -6,3 +6,4 @@ test.md
 wandb/
 history/
 __pycache__/
+.codex
