@@ -1,0 +1,223 @@
+sample_id,key,image_path,caption_original,caption_perturbed,mode,level,seed,clipscore_original,clipscore_perturbed,clipscore_gt,clipscore_drop,bertscore_original,bertscore_perturbed,bertscore_orig_vs_pert
+416:0:000000000,0,data/mtf2025_web_images/00000/000000000.jpg,"In this image we can see a sandwich on the wooden board. In the background we can see tomatoes, lettuce, knife and other objects.","Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Subscribe:
+Sub",orthogonal,1.0,1337,32.582374572753906,23.90259552001953,34.12458419799805,-8.679779052734375,0.8721094131469727,0.720308780670166,0.7373047471046448
+416:1:000000001,1,data/mtf2025_web_images/00000/000000001.jpg,In this image we can see a plate containing food.,- is the only: 1; 1.,orthogonal,1.0,1337,27.538755416870117,19.384557723999023,33.25613021850586,-8.154197692871094,0.8272244334220886,0.7997269034385681,0.837087869644165
+416:2:000000002,2,data/mtf2025_web_images/00000/000000002.jpg,"In this image I can see a plate and on it I can see a sandwich, few tomatoes and a salad.",is a type of person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is a person who is,orthogonal,1.0,1337,34.12925720214844,21.015804290771484,38.34334182739258,-13.113452911376953,0.8596215844154358,0.6813885569572449,0.7246021628379822
+416:3:000000003,3,data/mtf2025_web_images/00000/000000003.jpg,In this image we can see a sandwich on the table.,1.,orthogonal,1.0,1337,29.132076263427734,22.6903076171875,32.365692138671875,-6.441768646240234,0.8376092910766602,0.8377419710159302,0.880964457988739
+416:4:000000004,4,data/mtf2025_web_images/00000/000000004.jpg,"In this image I can see a plate in the center and on it I can see a sandwich which is made of bread, tomatoes, lettuce and few other things. In the background I can see few tomatoes, few bowls and few other things.",,orthogonal,1.0,1337,33.844261169433594,,34.22566223144531,,0.8344791531562805,,
+416:5:000000005,5,data/mtf2025_web_images/00000/000000005.jpg,In this image we can see a food item.,,orthogonal,1.0,1337,28.85335350036621,,35.79680252075195,,0.847553551197052,,
+416:6:000000006,6,data/mtf2025_web_images/00000/000000006.jpg,In this image I can see a sandwich on the wooden board.,"Viewed,
+
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,
+Viewed,",orthogonal,1.0,1337,28.762775421142578,24.51261329650879,40.96153259277344,-4.250162124633789,0.8581591844558716,0.7160437107086182,0.7433638572692871
+416:7:000000007,7,data/mtf2025_web_images/00000/000000007.jpg,"In this image we can see a table. On the table there are some food items, a knife and a bowl.",1.,orthogonal,1.0,1337,25.424232482910156,24.220417022705078,31.139713287353516,-1.2038154602050781,0.8475552797317505,0.8568313717842102,0.8676325082778931
+416:8:000000008,8,data/mtf2025_web_images/00000/000000008.jpg,In this image we can see a plate on the table. On the plate there is a food item.,,orthogonal,1.0,1337,27.125946044921875,,23.058631896972656,,0.7380080223083496,,
+416:9:000000009,9,data/mtf2025_web_images/00000/000000009.jpg,In this image we can see a plate containing food and a tomato.,"The first, is a small for:
+
+
+
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The first, is a small for:
+The",orthogonal,1.0,1337,28.587522506713867,21.55974578857422,32.218082427978516,-7.027776718139648,0.8158513903617859,0.7404547929763794,0.7853093147277832
+416:10:000000010,10,data/mtf2025_web_images/00000/000000010.jpg,In this image I can see a sandwich in the box.,"Posted by:
+
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:
+Posted by:",orthogonal,1.0,1337,27.63630485534668,21.758197784423828,34.19572067260742,-5.878107070922852,0.8375999331474304,0.70389324426651,0.7389238476753235
+416:11:000000011,11,data/mtf2025_web_images/00000/000000011.jpg,In this image we can see a plate containing food items on the surface.,,orthogonal,1.0,1337,25.183311462402344,,34.0374755859375,,0.8543574213981628,,
+416:12:000000012,12,data/mtf2025_web_images/00000/000000012.jpg,"In this image we can see a wooden plate containing some food items, a knife and a spoon.",----------------al.,orthogonal,1.0,1337,27.833534240722656,19.698196411132812,32.927711486816406,-8.135337829589844,0.8128699064254761,0.7976190447807312,0.8445389270782471
+416:13:000000014,14,data/mtf2025_web_images/00000/000000014.jpg,In this image we can see a sandwich on the plate.,-20.,orthogonal,1.0,1337,31.224721908569336,18.959522247314453,28.509389877319336,-12.265199661254883,0.8094218969345093,0.8140919208526611,0.8658342957496643
+416:14:000000015,15,data/mtf2025_web_images/00000/000000015.jpg,In this image we can see a sandwich on the plate.,are the most likely to be able.,orthogonal,1.0,1337,28.162277221679688,18.76957130432129,37.28262710571289,-9.392705917358398,0.8533909320831299,0.8202386498451233,0.8644915819168091
+416:15:000000016,16,data/mtf2025_web_images/00000/000000016.jpg,In this image there is a table. On the table there is a plate. On the plate there is a sandwich. Beside the plate there is a jar. In the jar there is a drink.,"is a small, but not so small, but not so small.",orthogonal,1.0,1337,36.070499420166016,21.901775360107422,34.0056037902832,-14.168724060058594,0.817402720451355,0.8008776307106018,0.8161934614181519
